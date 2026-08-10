@@ -1,0 +1,9 @@
+# yaml-language-server: $schema=none
+
+# Environment block imports all secrets & variables from your central ESC profile
+environment:
+  - your-org/prod-ai-pipeline
+
+# Local configurations specific to the data platform stack execution
+config:
+  aws:region: us-east-1

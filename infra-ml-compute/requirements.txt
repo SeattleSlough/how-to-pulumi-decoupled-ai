@@ -1,0 +1,5 @@
+# Pulumi Core Engine
+pulumi>=3.0.0,<4.0.0
+
+# Kubernetes Cluster & Object Storage Provider
+pulumi-kubernetes>=4.0.0,<5.0.0

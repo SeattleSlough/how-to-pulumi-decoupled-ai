@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=none
+
+# Environment block imports all secrets & variables from your central ESC profile
+environment:
+  - your-org/prod-ai-pipeline
+
+# Compute-specific inputs read by the config.require() statements in your python code
+config:
+  # Instructs this compute stack where to look to read the StackReference
+  compute-runner:upstream-data-project: your-org/data-platform/production

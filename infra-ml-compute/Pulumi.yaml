@@ -1,0 +1,5 @@
+# yaml-language-server: $schema=none
+
+name: compute-runner
+runtime: python
+description: Just-in-time CoreWeave H100 compute nodes and accelerated local caching.

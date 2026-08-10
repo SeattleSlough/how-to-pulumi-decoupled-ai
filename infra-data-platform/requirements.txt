@@ -1,0 +1,7 @@
+# Pulumi Core Engine
+pulumi>=3.0.0,<4.0.0
+
+# Cloud Infrastructure Providers
+pulumi-aws>=6.0.0,<7.0.0
+pulumi-databricks>=1.0.0,<2.0.0
+pulumi-megaport>=0.5.0,<1.0.0

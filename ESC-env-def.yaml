@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=none
+
+# Environment: your-org/prod-ai-pipeline
+values:
+  - aws:
+      # ESC opens an OIDC connection to AWS Secrets Manager to grab your Megaport credentials
+      secrets:
+        fn::open::aws-secrets:
+          region: us-east-1
+          secretId: prod/megaport/api
+  - coreweave:
+      kubeconfig:
+        fn::open::aws-secrets:
+          region: us-east-1
+          secretId: prod/coreweave/kubeconfig
+  - global:
+      environment: production
+      databricks-account-id: "your-databricks-account-id"
