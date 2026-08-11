@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=none
+
+# Environment block imports all secrets & variables from the central ESC profile
+environment:
+- your-org/prod-ai-pipeline
+
+# coreweaveKubeconfig arrives via the ESC environment's pulumiConfig block.
+# The StackReference target in __main__.py is built dynamically from the
+# stack name, so no upstream-project override is needed here.
+config: {}

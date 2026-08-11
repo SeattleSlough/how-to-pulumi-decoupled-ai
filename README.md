@@ -1,240 +1,281 @@
-# The Decoupled AI Factory: Bridging Enterprise Data Lakes and Ephemeral GPU Compute with Pulumi
+# Decoupled AI Factory Implementation Blueprint
 
-## The Evolution of Enterprise AI Architecture
+This repository provides an automated Infrastructure-as-Software blueprint for deploying a **decoupled AI stack** across AWS, Databricks, and CoreWeave using Pulumi and GitHub Actions.
 
-To optimize for cost, security, and flexibility, infrastructure and data teams supporting production-grade AI systems implement an architecture that co-locates data and compute in the same cloud provider environment. The industry move towards the interoperable lakehouse with its open-sourced solutions such as Iceberg, Polaris, and Unity have, in theory, enhanced the value of this architecture.
-
-The top Data Intelligence platforms in the market today are Databricks and Snowflake, with the former being the primary choice of data scientists, and by extension, is the leading platform for AI-related workloads. These platforms offer a robust and powerful set of capabilities and make money by charging for compute time based on the combination of the underlying cost of using the cloud provider’s compute and a fee from the Data Intelligence provider. As such, compute time comes at a premium. For heavy AI compute, that pricing model can create tension between the needs of data scientists and the desire of the business to stay within set budgets.
-
-To address this tension, for massive training or inference runs, companies are increasingly employing a decoupled AI stack, moving away from a monolithic architecture to one that is modular. In short, among other things, the decoupled AI stack arbitrages compute by moving it outside the hyperscaler’s cloud. Companies maintain all the benefits of their Data Intelligence platform and gain access to cheap, bare-metal GPUs provided by specialized AI clouds like CoreWeave and Lambda Labs.
-
-It’s an elegant solution, but it introduces a major obstacle for platform engineers: bridging completely independent cloud ecosystems without relying on brittle, manually maintained glue code.
-
-This guide uses an imagined company stack of AWS, Databricks, and CoreWeave leveraging GitHub for its GitOps pipelines to demonstrate how Pulumi acts as a unified infrastructure control plane to solve this challenge. By turning cross-cloud networking, data governance links, and zero-trust credentials into programmable software objects, Pulumi provides the deterministic foundation that allows modern GitOps pipelines to automate this multi-cloud handshake safely, securely, and efficiently.
-
-***View the complete implementation repository at: [//github.com](https://github.com)***
+**Note:** This document assumes working familiarity with Pulumi concepts (stacks, outputs, providers, `pulumi.Config`) and focuses on the architectural decisions specific to this cross-cloud pattern. For Pulumi fundamentals, see [pulumi.com/docs](https://pulumi.com/docs/).
 
 ---
 
-## 1. The Architectural Friction: Storage Perimeters vs. Ephemeral Hardware
+## 1. Objective: What Are We Building?
 
-The decoupled AI stack mixes enterprise data lakes in one cloud with specialized raw compute in another, an architecture that requires managing two distinct data streams simultaneously.
+This blueprint bridges the gap between enterprise data governance and high-density, low-cost GPU compute.
 
-From the perspective of the AWS environment, the architecture looks like this:
+By uncoupling your data lakehouse from your compute engine, you maintain enterprise data security and line-of-sight governance inside **AWS and Databricks**, while running high-density AI training/inference workloads on **CoreWeave's bare-metal NVIDIA H100 clusters**. Pulumi serves as the unified cross-cloud control plane that coordinates networking, zero-trust dynamic credentials, and automated infrastructure teardowns.
+
+### Key Technical Outcomes
+
+* **Zero Static Keys:** Dynamic OIDC token federation using **Pulumi ESC**.
+* **Isolated Cloud Lifecycles:** Decoupled stacks using **Pulumi Stack References** to separate long-lived storage from ephemeral hardware.
+* **Runaway Cost Prevention:** Programmatic failure traps and automated lifecycle teardowns to prevent $0/hour compute states from idling when jobs fail or complete.
+* **A Real Cross-Cloud Network Path:** A Megaport private circuit between AWS and CoreWeave, provisioned as part of the permanent data plane — not assumed to exist.
+
+---
+
+## 2. Architectural Overview
 
 ```text
-               ┌────────────────────────────────────────┐
-               │        AWS / DATABRICKS PERIMETER      │
-               │                                        │
-               │   ┌──────────────┐      ┌──────────┐   │
-               │   │ Training Data│      │S3 Model  │   │
-               │   │ (Delta Lake) │      │Repository│   │
-               │   └──────┬───────┘      └────▲─────┘   │
-               └──────────┼───────────────────┼─────────┘
-                          │                   │
-            1. OUTBOUND   │                   │   2. INBOUND
-           Micro-Batches  │                   │  Checkpoint Sync
-           (Streaming API)│                   │  (Boto3 / AWS CLI)
-                          ▼                   │
-               ┌──────────────────────────────┴─────────┐
-               │         COREWEAVE GPU CLUSTER          │
-               │                                        │
-               │      [ NVIDIA H100 Training Pod ]      │
-               └────────────────────────────────────────┘
+               ┌─────────────────────────────────────────────────────────┐
+               │              AWS / DATABRICKS PERIMETER                 │
+               │                                                         │
+               │   ┌─────────────────────┐     ┌─────────────────────┐   │
+               │   │  AWS S3 LAKEHOUSE   │     │  AWS S3 MODEL STORE │   │
+               │   │ (Mosaic Data Shard) │     │ (Epoch Checkpoints) │   │
+               │   └──────────┬──────────┘     └──────────▲──────────┘   │
+               └──────────────┼───────────────────────────┼──────────────┘
+                              │                           │
+                1. OUTBOUND   │                           │   2. INBOUND
+               Micro-Batches  │                           │  Checkpoint Sync
+               (Streaming API)│                           │  (Boto3 / AWS CLI)
+                              ▼                           │
+               ┌──────────────────────────────────────────┴──────────────┐
+               │               COREWEAVE GPU CLUSTER                     │
+               │         (reached via a Megaport private circuit)        │
+               │        [ NVIDIA H100 Node + Local NVMe Scratch ]        │
+               └─────────────────────────────────────────────────────────┘
 ```
 
-### The Data Handoff (Outbound Stream)
-GPUs cannot natively digest a giant SQL database or relational table format. Because of this, data engineering pods use Databricks Spark clusters inside AWS to flatten datasets into an open-source, binary shard format called MDS (Mosaic Data Shards).
-
-The core requirement is that these files cannot be permanently copied over to CoreWeave. Instead, the training container must treat that S3 storage directory like a streaming API, pulling tiny, fast micro-batches over an encrypted network directly into RAM, feeding the GPU, and immediately wiping the cache locally.
-
-### The Intellectual Property Loop (Inbound Sync)
-As the model runs, it periodically dumps mathematical snapshots of its learning progress, known as checkpoints. Because the specialized compute nodes are temporary, a background daemon (like the AWS CLI or boto3) must continuously push these model weights back across the cross-cloud tunnel into a secure, permanent AWS S3 repository before the servers are shut down.
+Two Pulumi stacks implement this: `infra_data_platform` (permanent) and `infra_ml_compute` (ephemeral). The sections below walk through each piece of the lifecycle — why it's needed, and a representative snippet of how it's built. Full implementations are linked inline; none of the code below is complete or meant to be copy-pasted as-is.
 
 ---
 
-## 2. The Blast Radius: The Cost of Getting It Wrong
+## 3. Environment & Identity Federation
 
-This architecture is designed to optimize AI compute spend but it isn’t without potentially significant risk. In a decoupled AI stack, a multi-cloud infrastructure failure can result in immediate financial and architectural damage.
+**Why:** Storing static AWS or CoreWeave tokens in CI/CD secrets or state files creates an audit liability — anyone with read access to the state store effectively has standing account access.
 
-### Financial Damage
-Operational costs can stack up during an infrastructure hang, the magnitude of which depends on when the failure strikes:
+**How:** Pulumi ESC opens a short-lived OIDC session with AWS, then reuses that same session to authenticate every downstream secret fetch — so nothing in this pipeline ever touches a long-lived credential:
 
-| Cost Component | Weekend Hang (48 Hours) | Weekday Crash (2 Hours) |
-| :--- | :--- | :--- |
-| **Wasted GPU Compute** | \$75,632.64 | \$3,151.36 |
-| **Engineering Interruption Labor** | \$0.00 | \$2,000.00 |
-| **AWS Data Egress Re-Run Tax** | \$3,500.00 | \$3,500.00 |
-| **Total Incident Loss** | **\$79,132.64** | **\$8,651.36** |
-
-*(Economic data calculated utilizing CoreWeave’s standard rate of [\$49.24 per hour for an 8-GPU NVIDIA HGX H100 node](https://coreweave.com), mapping a 32-node training cluster workload at \$1,575.68/hr, alongside a standard \$70/TB AWS S3 external cross-cloud data egress penalty to reload a 50TB dataset epoch).*
-
-### Architectural Damage
-* **State Engine Desynchronization:** Broken pipeline connections orphan active cross-cloud network tunnels and bare-metal nodes, leaving behind "ghost infrastructure" that corrupts state registries and causes immediate resource collisions.
-* **Cache Extermination and Latency Penalties:** Naive automated tear-downs erase high-speed local chassis NVMe data buffers, forcing subsequent runs into a "cold-start" loop that wastes hours re-streaming terabytes of data.
-* **Checkpoint Poisoning and Forensic Friction:** Undetected infrastructure faults cause corrupted training snapshots to upload into permanent storage buckets, degrading data lineage and requiring days of manual verification.
-
-It’s therefore critical that a company uses an IaC solution that can avoid these pitfalls.
-
----
-
-## 3. The Challenge with Legacy IaC (Terraform or OpenTofu)
-
-If a platform engineering team tries to build this type of decoupled architecture using static, domain-specific configuration languages like Terraform or OpenTofu, they run into massive operational roadblocks:
-
-* **Brittle State File Chaining:** Terraform isolates state configurations rigidly. Because Databricks and CoreWeave live in completely different cloud ecosystems, engineers cannot cleanly pass live properties from one provider to another without fracturing their repository design. So, they are forced to maintain split codebases and write fragile shell wrappers to scrape JSON variables out of one state file and manually paste them into another.
-* **Static Secret Spillage:** Passing an ephemeral data-access token over to a CoreWeave runner via Terraform requires rendering it into plaintext variables or writing it permanently inside a static Terraform state file sitting in a storage bucket. This creates an immediate (and likely intolerable) security exposure risk for an enterprise lakehouse.
-* **Total Application Blindness:** Terraform can build a cluster, but it cannot listen to the processes running inside it. Creating a cost kill switch or a failure-based alert freeze requires building highly complex, external orchestration workarounds outside the infrastructure tool. If an external custom tooling network-times out mid-run, the destroy step is never called, leaving a high-cost GPU cluster idling at the company's expense.
-* **The Imperative Pipeline Blockade (GitOps Inversion):** Traditional IaC tools require a synchronous, blocking push command (`terraform apply`) to build infrastructure. When integrated into a GitOps pipeline, the automation runner must sit active and idling for the entire duration of a multi-day AI training loop just to execute the subsequent cleanup task. If the runner hits a routine execution timeout and disconnects mid-run, the execution thread is severed. Because the tool cannot decouple resource creation from application lifetimes, the teardown hook never fires—orphaning the high-cost GPU cluster and leaving it billing at peak rates indefinitely.
-
----
-
-## 4. The Pulumi Cross-Cloud Pipeline
-Pulumi treats cloud providers as software objects within a single program, eliminating the need to bridge distinct infrastructure environments with manual glue code. Using Databricks as the secure foundation for data governance and preparation, Pulumi acts as the unified cross-cloud control plane to coordinate the downstream compute infrastructure across a structured, chronological lifecycle:
-
-```text
-THE PIPELINE EXECUTION SEQUENCE
-====================================================================================================
-[ LOCAL CODE REPO ] ──► PUSH TO MAIN BRANCH
-                             │
-                             ▼
-[ PHASE 1: UNIT TEST ] ──► Run Local Mocks & Validate Logic (pytest) ──► [ FAIL ] ──► HALT WORKFLOW
-                             │ (Passes: $0 Spent)
-                             ▼
-[ PHASE 2: SECURITY ]  ──► Open OIDC Boundary ──► Fetch AWS/CoreWeave Session Tokens (Pulumi ESC)
-                             │
-                             ▼
-[ PHASE 3: PROVISION ] ──► Query Permanent Data Stack Outputs (Pulumi Stack References)
-                             │
-                             └──► Spin up Just-in-Time H100 GPU Clusters on CoreWeave
-                                  Inject Accelerated Local Storage Caches (LOTA™ NVMe)
-                                  Launch Model Training Loop
-                                  │
-                                  ▼
-[ PHASE 4: EXECUTION ] ──► Track Runtime Status Codes via GitHub Actions Runner
-                                  │
-                                  ├───► [ IF EXIT 0: CLEAN SUCCESS ]
-                                  │     Execute 'pulumi destroy' ──► Terminate Hardware & Stop Billing
-                                  │
-                                  └───► [ IF EXIT != 0: CRITICAL FAILURE ]
-                                        Trigger Bash Error Trap ──► Fire Slack / PagerDuty Alerts
-                                        Lock Pod in Infinite Sleep Hold ──► Freeze Local NVMe Caches
-====================================================================================================
+```yaml
+# ESC-env-def.yaml (excerpt)
+values:
+  aws:
+    login:
+      fn::open::aws-login:
+        oidc:
+          duration: 2h
+          roleArn: arn:aws:iam::123456789012:role/PulumiEscGitHubRole
+          sessionName: pulumi-esc-session
+    secrets:
+      fn::open::aws-secrets:
+        region: us-east-1
+        login: ${aws.login}      # reuses the OIDC session above
+        get:
+          coreweaveKubeconfig:
+            secretId: prod/coreweave/kubeconfig
 ```
 
-### Phase 1: Shift-Left Infrastructure: Zero-Cost Architectural Validation
-Before any resource is invoked, Pulumi allows platform teams to execute programmatic zero-cost unit tests using standard testing frameworks like `pytest`. By leveraging `pulumi.runtime.set_mocks()`, the pipeline intercepts API calls to AWS, Databricks, and CoreWeave, simulating the entire multi-cloud configuration in memory.
+Full definition: [`ESC-env-def.yaml`](./ESC-env-def.yaml).
 
-These tests run in milliseconds on local developer machines or PR-validation runners without requiring cloud credentials, requiring zero secret tokens, and costing zero dollars. This phase mathematically verifies that the error trap is properly armed, VPC CIDR segments don't overlap, and exact hardware strings are free of syntax typos.
+---
+
+## 4. Permanent Data Plane
+
+**Why:** S3 storage, the Databricks workspace, Unity Catalog, and the network bridge to CoreWeave should never be torn down when a GPU training run finishes — they outlive any individual job.
+
+**How:** `infra_data_platform` provisions that permanent footprint and exports the handles the compute stack will need, including the Megaport private circuit that actually connects the two clouds:
 
 ```python
-# infra-ml-compute/tests/test_ml_compute.py (Highlight)
-import unittest
-import pulumi
+# infra_data_platform/__main__.py (excerpt)
+megaport_provider = megaport.Provider("mp-provider", api_token=megaport_token)
 
-# Assert that the custom failure-handling script contains our debug hold loop
-@pulumi.runtime.test
-def test_error_trap_contains_infinite_sleep(self):
-    def check_bash_shield(pod_spec):
-        bash_args = pod_spec["containers"]["args"]
-        self.assertIn("while true; do sleep 3600; done", bash_args)
-        self.assertIn("Locking compute & NVMe states.", bash_args)
-    return pulumi.Output.all(runner.training_pod.spec).apply(check_bash_shield)
-```
-
-### Phase 2: Zero-Trust Identity Federation via Pulumi ESC
-Instead of generating static, long-lived access tokens that sit exposed in code, the platform uses Pulumi ESC (Environments, Secrets, and Configuration). Pulumi ESC opens a secure OpenID Connect (OIDC) trust boundary between GitHub Actions, AWS, and CoreWeave.
-
-At runtime, ESC dynamically fetches short-lived, read-only temporary session credentials from AWS Secrets Manager and handles the token exchange with CoreWeave's API surface. This restricts down the generated MDS/Parquet streaming directories to a single, time-bound training execution window.
-
-### Phase 3: Just-in-Time Ephemeral Compute Plane Provisioning
-To eliminate idle infrastructure costs, the CoreWeave environment sits at $0/hour until a pipeline run is requested. Pulumi separates this architecture cleanly into two decoupled codebases using Pulumi Stack References:
-* **The Permanent Data Plane Stack:** Your core AWS network, Databricks workspace, Unity Catalog, and Megaport cloud exchange connection are managed as a permanent asset that is never destroyed.
-* **The Ephemeral Compute Plane Stack:** Using a Stack Reference, this codebase "peeks" into the outputs of the live data plane to pull the target S3 asset routes. Pulumi then provisions the raw NVIDIA H100 bare-metal GPU clusters on CoreWeave, mounts the node's local NVMe chassis array, and securely injects the streaming and checkpoint credentials straight into the container as encrypted `pulumi.Output` secrets.
-
-```python
-# infra-ml-compute/__main__.py (Highlight)
-import pulumi
-import pulumi_kubernetes as k8s
-
-# Read permanent state outputs via a Multi-Project Stack Reference
-data_platform = pulumi.StackReference("your-org/data-platform/production")
-
-inbound_stream = data_platform.get_output("lakehouse_url").apply(
-    lambda url: f"{url}?mode=streaming&framework=mosaic_streaming"
+cross_cloud_bridge = megaport.Vxc(
+    "aws-coreweave-private-pipe",
+    rate_limit=10000,
+    a_end_mcr_id="your-aws-direct-connect-gateway-id",
+    b_end_mcr_id="coreweave-datacenter-pop-id",
+    opts=pulumi.ResourceOptions(provider=megaport_provider),
 )
 
-# Initialize the CoreWeave Kubernetes Provider natively
-coreweave_provider = k8s.Provider("cw-engine", kubeconfig=config.require("kubeconfig"))
+pulumi.export("lakehouse_url", external_data_volume.url)
+pulumi.export("checkpoint_bucket_id", checkpoint_bucket.id)
 ```
 
-### Phase 4: GitOps Orchestration & Automated Error Trapping
-While Pulumi handles declarative infrastructure creation rather than long-running application workflow loops, it maps seamlessly into a programmatic GitOps deployment structure. By combining a bare Kubernetes Pod specification with an environment wrapper, Pulumi deploys an automated runtime containment layer.
-The pipeline tracks the container's execution state via GitHub Actions to automate the infrastructure lifecycle:
-* **Clean Success:** If the training script completes its training matrix cleanly and syncs all final weights to S3, it exits with `status 0`. The runner captures this code and instantly executes `pulumi destroy` on the compute stack, turning off the high-cost GPU billing clock.
-* **Resilient Failure Lock:** If the training script hits an out-of-memory (OOM) exception or a hardware fault, a naive, immediate automated teardown would delete the exact local node logs needed to diagnose the crash. The wrapper container intercepts the failure, enters an infinite sleep hold loop to keep the physical hardware node active, and triggers real-time payloads out to a notification endpoint (in this case, Slack/PagerDuty). This locks the internal `/mnt/local` NVMe flash memory arrays in place, avoiding the architectural damage from failure and enabling engineers to jump into a live debugging terminal before using a manual override pipeline to clean the space.
-
-```python
-# infra-ml-compute/__main__.py (Container Configuration)
-"containers": [{
-    "name": "mosaic-training-runner",
-    "image": "ghcr.io/your-org/mosaic-flash-attention:latest",
-    "command": ["/bin/bash", "-c"],
-    "args": [
-        """
-        python3 -m llm_train.launch --config 70b_config.yaml;
-        if [ $? -eq 0 ]; then
-            echo 'SUCCESS: Weights pushed to S3.' > /dev/termination-log; exit 0
-        else
-            echo 'CRITICAL FAILURE: Locking NVMe states.' > /dev/termination-log
-            while true; do sleep 3600; done # Infinite loop blocks teardown
-        fi
-        """
-    ],
-    "volumeMounts": [{"mountPath": "/mnt/local", "name": "local-nvme-scratch"}]
-}]
-```
+Full implementation: [`infra_data_platform/__main__.py`](./infra_data_platform/__main__.py).
 
 ---
 
-## 5. The Imperative for an Infrastructure-as-Software Defined AI Stack
-A decoupled AI stack solves a major tension within enterprises: it allows data teams to run massive foundational training and inference workloads without forcing the business to absorb premium hyperscaler GPU markups (or curtail work to avoid them). However, if an enterprise allows its multi-cloud architecture to be dictated by the rigid, file-based limitations of legacy Infrastructure as Code, they simply trade away cloud provider premiums for an unmanageable tax of manual glue code, security exposures, and orphaned compute costs.
+## 5. Ephemeral Compute Plane
 
-Legacy, push-based DSL tools cannot bridge this cross-cloud chasm safely. They are inherently blind to application lifecycles and incapable of handling the asynchronous relationship between a permanent data lakehouse and a short-lived GPU cluster.
+**Why:** GPU nodes billing at $1,500+/hr should sit at $0/hr until an explicit execution request is made, and should read the permanent stack's outputs rather than duplicating that state.
 
-By unifying the multi-cloud infrastructure plane into a strongly typed software layer, Pulumi provides the programmatic tools required to orchestrate this modern architecture at scale. Leveraging **Pulumi ESC** for dynamic, zero-trust token federation and **Pulumi Stack References** to decouple independent cloud lifecycles transforms infrastructure from a static constraint into an active competitive advantage.
+**How:** `infra_ml_compute` reads the data stack via `pulumi.StackReference`, built dynamically so it always points at the environment currently in use:
 
-Ultimately, companies that harness a software-defined infrastructure control plane can convert raw infrastructure savings directly into deeper model iterations, faster time-to-market, and compounding business ROI. As model complexity accelerates, the ability to automate a secure, cost-controlled AI factory will separate the enterprises that merely experiment with AI from those that dominate the market.
+```python
+# infra_ml_compute/__main__.py (excerpt)
+env = pulumi.get_stack()
+data_platform = pulumi.StackReference(f"your-org/data-platform/{env}")
 
-===
+inbound_stream_endpoint = data_platform.get_output("lakehouse_url").apply(
+    lambda url: f"{url}?mode=streaming&framework=mosaic_streaming"
+)
+```
 
-## Next Steps for Review
-The implementation files supporting this whitepaper framework are structured cleanly into the following repository code blueprint modules:
+The training pod itself is defined with Pulumi's typed Kubernetes SDK classes rather than raw dicts — a malformed field gets caught when the code is written, not when it's deployed:
+
+```python
+# infra_ml_compute/__main__.py (excerpt)
+containers=[
+    k8s.core.v1.ContainerArgs(
+        name="mosaic-training-runner",
+        resources=k8s.core.v1.ResourceRequirementsArgs(
+            limits={"nvidia.com/gpu": "8", "cpu": "128", "memory": "1000Gi"},
+        ),
+        # ...
+    )
+]
+```
+
+Full implementation: [`infra_ml_compute/__main__.py`](./infra_ml_compute/__main__.py).
+
+---
+
+## 6. The Failure Trap
+
+**Why:** A naive teardown on any non-zero exit code destroys the exact NVMe logs and node state an engineer needs to debug a crash. A naive *lack* of teardown on success leaves an idle $1,500+/hr node billing indefinitely.
+
+**How:** The container entrypoint checks its own exit status before deciding whether to release the node:
+
+```bash
+python3 -m llm_train.launch --config 70b_config.yaml
+STATUS=$?
+if [ $STATUS -eq 0 ]; then
+    echo 'SUCCESS: Checkpoints safely pushed to AWS S3.' > /dev/termination-log
+    exit 0
+else
+    echo 'CRITICAL FAILURE: Locking compute & NVMe states.' > /dev/termination-log
+    while true; do sleep 3600; done   # holds the node open for inspection
+fi
+```
+
+On success, the pipeline's next step runs `pulumi destroy` immediately. On failure, it alerts and leaves the node in this hold state until someone runs the manual cleanup workflow. Full context: [`infra_ml_compute/__main__.py`](./infra_ml_compute/__main__.py).
+
+---
+
+## 7. Shift-Left Unit Verification
+
+**Why:** A syntax error, a malformed resource key, or a missing variable shouldn't trigger an expensive hardware allocation to discover.
+
+**How:** `pulumi.runtime.set_mocks()` intercepts every cloud API call, so `pytest` can validate the actual resource graph — including the exact GPU resource key CoreWeave expects — with zero cloud credentials and zero cost:
+
+```python
+# infra_ml_compute/tests/test_ml_compute.py (excerpt)
+def test_gpu_resource_limits_are_correct(self):
+    def check_limits(args):
+        limits = args[0]["containers"][0]["resources"]["limits"]
+        self.assertIn("nvidia.com/gpu", limits)
+        self.assertEqual(limits["nvidia.com/gpu"], "8")
+    return pulumi.Output.all(runner.training_pod.spec).apply(check_limits)
+```
+
+This test exists because an earlier draft of this stack used a malformed key (`"://nvidia.com"`) that would have failed at deploy time — and had a test that asserted the broken value instead of catching it. Full test suite: [`infra_ml_compute/tests/test_ml_compute.py`](./infra_ml_compute/tests/test_ml_compute.py), [`infra_data_platform/tests/test_data_platform.py`](./infra_data_platform/tests/test_data_platform.py).
+
+---
+
+## 8. GitOps Lifecycle Orchestration
+
+A traditional `terraform apply` needs a long-running, active pipeline runner for the full duration of a multi-day training job — if that runner's connection drops mid-run, the teardown step never fires and the cluster bills indefinitely.
+
+This pipeline gates deployment behind the unit-test job, then streams the training pod's actual logs to capture its real exit code rather than assuming success:
+
+```text
+THE PROGRAMMATIC GITOPS LIFECYCLE
+===================================================================================
+[ TRIGGER ] ────────► Manual GUI / Push to Main / Cron / Repository Webhook
+                           │
+                           ▼
+[ PHASE 1 ] ────────► Shift-Left Validation (pytest + set_mocks)      [ Pass: $0 Spent ]
+                           ▼
+[ PHASE 2 ] ────────► Provision Ephemeral Stack (CoreWeave H100 Pod JIT Spin-up)
+                           ▼
+[ PHASE 3 ] ────────► Stream Logs, Capture Real Exit Code
+                           ├───► Exit 0 (Success) ──────► 'pulumi destroy' (Stop Billing)
+                           └───► Exit != 0 (Crash) ─────► Alert (Slack/PagerDuty) & Hold Node
+===================================================================================
+```
+
+Four trigger modes are wired into the pipeline, each suited to a different way training work gets kicked off:
+
+| Trigger | Use case |
+|---|---|
+| `workflow_dispatch` | Operator or data scientist starts a run manually from the GitHub UI |
+| `push` to `main` | Fires automatically when infra or training config changes merge |
+| `schedule` / `cron` | Recurring nightly or weekend batch runs |
+| `repository_dispatch` | An upstream orchestrator (Databricks Airflow/Dagster) triggers compute as soon as data prep finishes |
+
+Full pipeline: [`.github/workflows/train.yml`](./.github/workflows/train.yml). Manual force-teardown override: [`.github/workflows/cleanup.yml`](./.github/workflows/cleanup.yml).
+
+---
+
+## 9. Storage Strategy: How Mosaic Shards Are Handled
+
+A common question when building cross-cloud AI pipelines is whether to provision a persistent cloud storage volume (e.g., CoreWeave Block Storage) to land training datasets. This blueprint deliberately avoids persistent secondary storage on CoreWeave for the training data path — but does provision CoreWeave's accelerated object storage (`ObjectStorageBucket`) as a hot local cache layer for the currently-running job.
+
+PyTorch dataloaders (via `mosaicml-streaming`) can't stream directly into GPU VRAM from a WAN socket; they need a local filesystem path to stage, index, and decompress dataset shards. This blueprint mounts an ephemeral `emptyDir` local NVMe volume directly on the host chassis (`/mnt/local`), sized for the training footprint, backed by the accelerated cache bucket for throughput:
+
+* **Zero storage idle cost** — no 24/7 block storage fees; base-state compute spend stays at $0/hour.
+* **High throughput** — reads directly from local NVMe scratch space, matching GPU ingestion rates.
+* **Automatic purge on teardown** — the moment `pulumi destroy` runs, the kernel wipes the local cache; zero data footprint remains off-cloud.
+
+---
+
+## 10. Repository Structure
 
 ```text
 .
-├── documentation/                 # rename to .github/
-│   └── templates/                 # rename to workflows/
-│       ├── cleanup.yml            # Manual "Run Workflow" force-teardown override
-│       └── train.yml              # Main CI/CD pipeline (Tests -> Deploy -> Monitor -> Trap/Destroy)
-│
-├── infra-data-platform/           # --- PERMANENT COLD PLANE ---
-│   ├── Pulumi.yaml                # Core project naming and Python definition
-│   ├── Pulumi.production.yaml     # Environment configuration pointing to central ESC
-│   ├── __main__.py                # Main logic: AWS VPC, S3 Lakehouse, Databricks, Megaport Bridge
-│   ├── requirements.txt           # Dependencies: pulumi-aws, pulumi-databricks, pulumi-megaport
+├── ci_staged_gh/                  # Rename to .github/ - changed here to avoid kicking of gh action.
+│   └── workflows/
+│       ├── train.yml              # Main GitOps pipeline: test-gate → deploy → monitor → destroy/alert
+│       └── cleanup.yml            # Manual force teardown as only way to release node frozen post failure trap
+├── ESC-env-def.yaml               # Pulumi ESC central environment definition
+├── infra_data_platform/           # PERMANENT DATA PLANE STACK
+│   ├── Pulumi.yaml
+│   ├── Pulumi.production.yaml
+│   ├── __init__.py
+│   ├── __main__.py                # AWS VPC, S3 buckets, Databricks workspace, Megaport bridge
+│   ├── requirements.txt
 │   └── tests/
-│       ├── __init__.py            # (Empty file) Package initialization marker
-│       └── test_data_platform.py  # Unit tests verifying VPC ranges and Unity Catalog paths
-│
-|── infra-ml-compute/              # --- EPHEMERAL GPU PLANE ---
-|   ├── Pulumi.yaml                # Core project naming and Python definition
-|   ├── Pulumi.production.yaml     # Environment configuration pointing to central ESC and data stack
-|   ├── __main__.py                # Main logic: CoreWeave K8s Provider, LOTA Cache, Pod with NVMe Trap
-|   ├── requirements.txt           # Dependencies: pulumi-kubernetes
-|   └── tests/
-|       ├── __init__.py            # (Empty file) Package initialization marker
-|       └── test_ml_compute.py     # Unit tests verifying H100 counts, volume mounts, and bash traps
-|
-|── ESC-env-def.yaml               # structured centralized config file for namespace managed by Pulumi ESC
+│       ├── __init__.py
+│       └── test_data_platform.py
+└── infra_ml_compute/                # EPHEMERAL GPU COMPUTE STACK
+    ├── Pulumi.yaml
+    ├── Pulumi.production.yaml
+    ├── __init__.py
+    ├── __main__.py                 # CoreWeave K8s provider, NVMe cache bucket, pod with failure trap
+    ├── requirements.txt
+    └── tests/
+        ├── __init__.py
+        └── test_ml_compute.py
 ```
+
+**Note** stack directories use underscores to ensure Python functionality.
+
+---
+
+## 11. Deployment Verification
+
+To run a test deployment:
+
+1. Deploy the permanent data plane:
+   ```bash
+   cd infra_data_platform
+   pulumi stack select production
+   pulumi up --yes
+   ```
+
+2. Run local unit tests for both stacks:
+   ```bash
+   PYTHONPATH=. pytest infra_data_platform/tests/
+   PYTHONPATH=. pytest infra_ml_compute/tests/
+   ```
+
+3. Trigger `.github/workflows/train.yml` via the Actions tab, a push commit, the scheduled timer, or an upstream webhook dispatch.
+

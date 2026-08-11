@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=none
+
+# Environment block imports all secrets & variables from the central ESC profile
+environment:
+- your-org/prod-ai-pipeline
+
+config:
+  aws:region: us-east-1
+  # databricks-account-id, megaportToken, and coreweaveKubeconfig arrive via
+  # the ESC environment's pulumiConfig block above - no need to duplicate
+  # them here.

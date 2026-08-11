@@ -1,0 +1,37 @@
+# File: .github/workflows/cleanup.yml
+name: Manual GPU Cluster Force-Teardown
+
+on:
+  workflow_dispatch:
+    # Adds the manual "Run Workflow" button in the Actions UI
+
+jobs:
+  force_destroy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+    - name: Checkout Source Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Pulumi CLI Engine
+      uses: pulumi/actions@v5
+
+    - name: Install Compute Stack Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r infra_ml_compute/requirements.txt
+
+    # Overrides the error hold loop and destroys the ephemeral GPU compute
+    # resources immediately - use this to end an infinite-sleep debug hold
+    # once you've captured what you need from the frozen node.
+    - name: Execute Manual Cost-Saving Destroy
+      uses: pulumi/actions@v5
+      with:
+        command: destroy
+        stack-name: production
+        work-dir: infra_ml_compute
+      env:
+        PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}

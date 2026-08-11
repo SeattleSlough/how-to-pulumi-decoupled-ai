@@ -1,0 +1,140 @@
+# File: .github/workflows/train.yml
+name: Decoupled AI Training Pipeline
+
+on:
+  # Option A: Manual GUI Trigger - operators/data scientists start a run from
+  # the GitHub Actions UI with custom parameters.
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Deployment Environment'
+        required: true
+        default: 'production'
+
+  # Option B: Policy-Driven Branch Push - fires automatically when infra or
+  # training config changes merge to main.
+  push:
+    branches:
+    - main
+    paths:
+    - 'infra-ml-compute/**'
+    - 'infra_ml_compute/**'
+
+  # Option C: Scheduled Execution - e.g. nightly or weekend batch runs.
+  schedule:
+  - cron: '0 0 * * 0'
+
+  # Option D: External Event Webhook - upstream orchestrators (Databricks
+  # Airflow/Dagster) trigger compute as soon as data prep finishes.
+  repository_dispatch:
+    types: [ data_prep_complete ]
+
+jobs:
+  # ============================================================================
+  # STAGE 1: SHIFT-LEFT VALIDATION ($0 COST)
+  # ============================================================================
+  run_unit_tests:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Source Repository
+      uses: actions/checkout@v4
+
+    - name: Initialize Python Environment
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        cache: 'pip'
+
+    - name: Test Infrastructure Definitions (Data Platform Stack)
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r infra_data_platform/requirements.txt pytest
+        PYTHONPATH=. pytest infra_data_platform/tests/
+
+    - name: Test Infrastructure Definitions (ML Compute Stack)
+      run: |
+        pip install -r infra_ml_compute/requirements.txt pytest
+        PYTHONPATH=. pytest infra_ml_compute/tests/
+
+  # ============================================================================
+  # STAGE 2: JUST-IN-TIME GPU PROVISIONING, MONITORING, AND TEARDOWN
+  # ============================================================================
+  execute_gpu_workload:
+    needs: run_unit_tests # Deployment is blocked until tests pass cleanly
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Requesting the OIDC JWT for the AWS/ESC token exchange
+      contents: read
+
+    steps:
+    - name: Checkout Source Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Pulumi CLI Engine
+      uses: pulumi/actions@v5
+
+    - name: Install Runtime Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r infra_ml_compute/requirements.txt
+
+    - name: Provision Ephemeral CoreWeave Compute
+      id: pulumi_up
+      uses: pulumi/actions@v5
+      with:
+        command: up
+        stack-name: production
+        work-dir: infra_ml_compute
+      env:
+        PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+
+    - name: Stream Training Logs & Capture Exit Code
+      id: monitor
+      run: |
+        export KUBECONFIG=~/.kube/config-coreweave
+        echo "Awaiting hardware allocation on CoreWeave fabric..."
+        kubectl wait --for=condition=Ready pod/llama3-70b-trainer \
+          -n ephemeral-training-runners --timeout=600s || true
+
+        kubectl logs -f pod/llama3-70b-trainer -n ephemeral-training-runners
+
+        CONTAINER_EXIT_CODE=$(kubectl get pod llama3-70b-trainer \
+          -n ephemeral-training-runners \
+          -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' \
+          || echo "1")
+
+        echo "exit_code=$CONTAINER_EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+        if [ "$CONTAINER_EXIT_CODE" -ne "0" ]; then
+          echo "CRITICAL WARNING: Training job crashed. Issuing engineering alerts."
+          exit 1
+        fi
+
+    - name: Notify On Failure
+      if: failure() && steps.monitor.outcome == 'failure'
+      run: |
+        curl -X POST -H 'Content-type: application/json' \
+          --data '{"text":"🚨 *ML Cluster Crash Alert*: `llama3-70b-trainer` failed. Compute node and NVMe local storage are frozen for engineering inspection. Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' \
+          "${{ secrets.SLACK_WEBHOOK_URL }}"
+
+        curl -X POST "${{ secrets.PAGERDUTY_EVENTS_URL }}" \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "routing_key": "${{ secrets.PAGERDUTY_ROUTING_KEY }}",
+            "event_action": "trigger",
+            "payload": {
+              "summary": "CoreWeave GPU Cluster Training Failure: NVMe Frozen for Debugging",
+              "source": "GitHub Actions AI Pipeline",
+              "severity": "critical"
+            }
+          }'
+
+    - name: Automated Cost-Optimized GPU Teardown
+      if: success()
+      uses: pulumi/actions@v5
+      with:
+        command: destroy
+        stack-name: production
+        work-dir: infra_ml_compute
+      env:
+        PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}

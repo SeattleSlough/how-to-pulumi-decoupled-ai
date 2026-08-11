@@ -1,18 +1,43 @@
 # yaml-language-server: $schema=none
-
+#
 # Environment: your-org/prod-ai-pipeline
+#
+# Schema verified against Pulumi ESC docs (values: is a mapping, not a list;
+# secrets providers should reference the login block via ${aws.login} so the
+# short-lived OIDC session is actually used to authenticate the fetch).
+
 values:
-  - aws:
-      # ESC opens an OIDC connection to AWS Secrets Manager to grab your Megaport credentials
-      secrets:
-        fn::open::aws-secrets:
-          region: us-east-1
-          secretId: prod/megaport/api
-  - coreweave:
-      kubeconfig:
-        fn::open::aws-secrets:
-          region: us-east-1
-          secretId: prod/coreweave/kubeconfig
-  - global:
-      environment: production
-      databricks-account-id: "your-databricks-account-id"
+  aws:
+    login:
+      fn::open::aws-login:
+        oidc:
+          duration: 2h
+          roleArn: arn:aws:iam::123456789012:role/PulumiEscGitHubRole
+          sessionName: pulumi-esc-session
+    secrets:
+      fn::open::aws-secrets:
+        region: us-east-1
+        login: ${aws.login}
+        get:
+          megaportToken:
+            secretId: prod/megaport/api
+          coreweaveKubeconfig:
+            secretId: prod/coreweave/kubeconfig
+
+  environmentVariables:
+    AWS_REGION: us-east-1
+
+  coreweave:
+    kubeconfig: ${aws.secrets.coreweaveKubeconfig}
+
+  global:
+    environment: production
+    databricks-account-id: "your-databricks-account-id"
+
+  # Values exposed to Pulumi config via pulumiConfig so `pulumi.Config()` reads
+  # them without every stack needing its own `config.require_object("aws")` /
+  # `config.require_object("coreweave")` plumbing.
+  pulumiConfig:
+    megaportToken: ${aws.secrets.megaportToken}
+    coreweaveKubeconfig: ${aws.secrets.coreweaveKubeconfig}
+    databricks-account-id: ${global.databricks-account-id}
