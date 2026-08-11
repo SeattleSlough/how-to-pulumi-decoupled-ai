@@ -105,7 +105,7 @@ Full implementation: [`infra_data_platform/__main__.py`](./infra_data_platform/_
 
 ## 5. Ephemeral Compute Plane
 
-**Why:** GPU nodes billing at $1,500+/hr should sit at $0/hr until an explicit execution request is made, and should read the permanent stack's outputs rather than duplicating that state.
+**Why:** Assume you are standing up a 32-node (256-GPU) H100 cluster for a pretraining run that collectively bills at $1,500+/hr on-demand, or as low as $600/hr under an aggressive committed-capacity discount. That cluster should sit at $0/hr until an explicit execution request is made, and should read the permanent stack's outputs rather than duplicating that state.
 
 **How:** `infra_ml_compute` reads the data stack via `pulumi.StackReference`, built dynamically so it always points at the environment currently in use:
 
@@ -140,7 +140,7 @@ Full implementation: [`infra_ml_compute/__main__.py`](./infra_ml_compute/__main_
 
 ## 6. The Failure Trap
 
-**Why:** A naive teardown on any non-zero exit code destroys the exact NVMe logs and node state an engineer needs to debug a crash. A naive *lack* of teardown on success leaves an idle $1,500+/hr node billing indefinitely.
+**Why:** A naive teardown on any non-zero exit code destroys the exact NVMe logs and node state an engineer needs to debug a crash. A naive *lack* of teardown on success leaves an idle $1,500+/hr - $600/hr cluster billing indefinitely.
 
 **How:** The container entrypoint checks its own exit status before deciding whether to release the node:
 
