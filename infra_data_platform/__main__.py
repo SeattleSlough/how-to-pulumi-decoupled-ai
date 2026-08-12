@@ -34,6 +34,29 @@ for _name, _bucket in (
         restrict_public_buckets=True,
     )
 
+# Cost-control lifecycle policy: cleanup.yml rescues local NVMe data off a
+# frozen node into checkpoint_bucket under rescue/unverified/<pod-name>/
+# before teardown (see infra_ml_compute failure trap). That data has not
+# been validated by the training pipeline's own checkpoint marker, so it
+# should not accumulate indefinitely - auto-expire it after 30 days rather
+# than requiring someone to remember to clean it up manually.
+aws.s3.BucketLifecycleConfigurationV2(
+    "checkpoint-bucket-lifecycle",
+    bucket=checkpoint_bucket.id,
+    rules=[
+        aws.s3.BucketLifecycleConfigurationV2RuleArgs(
+            id="expire-unverified-rescue-data",
+            status="Enabled",
+            filter=aws.s3.BucketLifecycleConfigurationV2RuleFilterArgs(
+                prefix="rescue/unverified/",
+            ),
+            expiration=aws.s3.BucketLifecycleConfigurationV2RuleExpirationArgs(
+                days=30,
+            ),
+        )
+    ],
+)
+
 # 3. DATABRICKS WORKSPACE + UNITY CATALOG EXTERNAL LOCATION
 databricks_workspace = databricks.MwsWorkspaces(
     "enterprise-workspace",

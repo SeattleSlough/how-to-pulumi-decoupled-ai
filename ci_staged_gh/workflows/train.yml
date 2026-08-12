@@ -23,7 +23,6 @@ on:
   # Option C: Scheduled Execution - e.g. nightly or weekend batch runs.
   schedule:
   - cron: '0 0 * * 0'
-
   # Option D: External Event Webhook - upstream orchestrators (Databricks
   # Airflow/Dagster) trigger compute as soon as data prep finishes.
   repository_dispatch:
@@ -93,12 +92,12 @@ jobs:
       run: |
         export KUBECONFIG=~/.kube/config-coreweave
         echo "Awaiting hardware allocation on CoreWeave fabric..."
-        kubectl wait --for=condition=Ready pod/llama3-70b-trainer \
+        kubectl wait --for=condition=Ready pod/training-model \
           -n ephemeral-training-runners --timeout=600s || true
 
-        kubectl logs -f pod/llama3-70b-trainer -n ephemeral-training-runners
+        kubectl logs -f pod/training-model -n ephemeral-training-runners | tee /tmp/pipeline-stdout.log
 
-        CONTAINER_EXIT_CODE=$(kubectl get pod llama3-70b-trainer \
+        CONTAINER_EXIT_CODE=$(kubectl get pod training-model \
           -n ephemeral-training-runners \
           -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' \
           || echo "1")
@@ -114,7 +113,7 @@ jobs:
       if: failure() && steps.monitor.outcome == 'failure'
       run: |
         curl -X POST -H 'Content-type: application/json' \
-          --data '{"text":"🚨 *ML Cluster Crash Alert*: `llama3-70b-trainer` failed. Compute node and NVMe local storage are frozen for engineering inspection. Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' \
+          --data '{"text":"🚨 *ML Cluster Crash Alert*: `training-model` failed. Compute node and NVMe local storage are frozen for engineering inspection. Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' \
           "${{ secrets.SLACK_WEBHOOK_URL }}"
 
         curl -X POST "${{ secrets.PAGERDUTY_EVENTS_URL }}" \
@@ -128,6 +127,69 @@ jobs:
               "severity": "critical"
             }
           }'
+
+    # Runs automatically on failure.
+    # Files under a /logs/ subdirectory are copied to rescue-logs/.
+    # Everything else with a matching .done marker (written by the training script only
+    # after a confirmed-complete checkpoint flush) is copied to
+    # rescue-verified/. Anything remaining is copied to rescue-unverified/.
+    - name: Rescue Local NVMe Data (automatic, non-destructive)
+      id: rescue_nvme
+      if: failure() && steps.monitor.outcome == 'failure'
+      run: |
+        export KUBECONFIG=~/.kube/config-coreweave
+        POD_NAME="training-model"
+        NAMESPACE="ephemeral-training-runners"
+        RESCUE_PREFIX="$(date +%Y%m%d-%H%M%S)-${POD_NAME}"
+        echo "rescue_prefix=$RESCUE_PREFIX" >> "$GITHUB_OUTPUT"
+
+        mkdir -p /tmp/rescue
+        kubectl cp "${NAMESPACE}/${POD_NAME}:/mnt/local" /tmp/rescue --retries=3 || \
+          echo "WARNING: kubectl cp reported errors - node may be partially unreachable."
+
+        # Classification is based on directory location, not filename
+        # extension - the training script is expected to write its own
+        # logs under /mnt/local/logs/. Matching on a naming convention like
+        # "*.log" is fragile: any log file that doesn't happen to end in
+        # .log (a .txt file, a per-worker .out file, an extensionless
+        # stream) would have no .done marker either, and would silently
+        # fall into rescue-unverified/ alongside genuinely unverified
+        # checkpoint debris - diluting the one thing that bucket is meant
+        # to communicate clearly. A directory convention is something the
+        # data science team can follow deliberately rather than something
+        # that depends on guessing every possible log filename pattern.
+        #
+        # Classification prefix comes first in the key (rescue-logs/,
+        # rescue-verified/, rescue-unverified/), not the timestamped rescue
+        # folder - S3 lifecycle rules only match literal string prefixes,
+        # so the classification has to be the very first path segment for
+        # the lifecycle policy in infra_data_platform to be able to target
+        # it regardless of which incident or pod it came from.
+        for f in $(find /tmp/rescue -type f ! -name '*.done'); do
+          if [[ "$f" == */logs/* ]]; then
+            aws s3 cp "$f" "s3://${CHECKPOINT_BUCKET_ID}/rescue-logs/${RESCUE_PREFIX}/$(basename "$f")"
+          elif [ -f "${f}.done" ]; then
+            aws s3 cp "$f" "s3://${CHECKPOINT_BUCKET_ID}/rescue-verified/${RESCUE_PREFIX}/$(basename "$f")"
+          else
+            aws s3 cp "$f" "s3://${CHECKPOINT_BUCKET_ID}/rescue-unverified/${RESCUE_PREFIX}/$(basename "$f")"
+          fi
+        done
+      env:
+        CHECKPOINT_BUCKET_ID: ${{ secrets.CHECKPOINT_BUCKET_ID }}
+
+    # Captures the pipeline's own stdout/stderr stream - separate from
+    # anything the rescue step above pulls off local NVMe, since container
+    # logs live in Kubernetes' log stream, not on the pod's filesystem, and
+    # `kubectl cp` has no access to them. Shares the same rescue_prefix as
+    # the NVMe rescue step so both land under one incident folder in S3.
+    - name: Upload Pipeline Log Capture
+      if: failure() && steps.monitor.outcome == 'failure'
+      run: |
+        aws s3 cp /tmp/pipeline-stdout.log \
+          "s3://${CHECKPOINT_BUCKET_ID}/rescue-logs/${RESCUE_PREFIX}/pipeline-stdout.log"
+      env:
+        CHECKPOINT_BUCKET_ID: ${{ secrets.CHECKPOINT_BUCKET_ID }}
+        RESCUE_PREFIX: ${{ steps.rescue_nvme.outputs.rescue_prefix }}
 
     - name: Automated Cost-Optimized GPU Teardown
       if: success()

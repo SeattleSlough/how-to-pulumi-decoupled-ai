@@ -99,15 +99,42 @@ pulumi.export("lakehouse_url", external_data_volume.url)
 pulumi.export("checkpoint_bucket_id", checkpoint_bucket.id)
 ```
 
+This stack also carries a cost-control lifecycle policy on the checkpoint bucket: data rescued off a frozen node by `train.yml`'s failure branch (see Section 6) lands under three top-level prefixes — `rescue-unverified/`, `rescue-verified/`, and `rescue-logs/` — with unvalidated checkpoint data auto-expiring after 30 days and logs after 90, rather than accumulating indefinitely on the assumption someone remembers to clean it up. Verified checkpoint data is left alone, since someone may actually want to resume a run from it:
+
+```python
+# infra_data_platform/__main__.py (excerpt)
+aws.s3.BucketLifecycleConfigurationV2(
+    "checkpoint-bucket-lifecycle",
+    bucket=checkpoint_bucket.id,
+    rules=[
+        aws.s3.BucketLifecycleConfigurationV2RuleArgs(
+            id="expire-unverified-rescue-data",
+            status="Enabled",
+            # Classification has to be the leading path segment - S3
+            # lifecycle rules only match literal string prefixes, so a
+            # rule targeting "rescue/unverified/" would never match keys
+            # like "rescue/<incident>/unverified/..." where a timestamp
+            # sits in between.
+            filter=aws.s3.BucketLifecycleConfigurationV2RuleFilterArgs(
+                prefix="rescue-unverified/",
+            ),
+            expiration=aws.s3.BucketLifecycleConfigurationV2RuleExpirationArgs(days=30),
+        )
+        # A second rule (90-day expiration on rescue-logs/) is defined
+        # alongside this one - see the full file.
+    ],
+)
+```
+
 Full implementation: [`infra_data_platform/__main__.py`](./infra_data_platform/__main__.py).
 
 ---
 
 ## 5. Ephemeral Compute Plane
 
-**Why:** Assume you are standing up a 32-node (256-GPU) H100 cluster for a pretraining run that collectively bills at $1,500+/hr on-demand, or as low as $600/hr under an aggressive committed-capacity discount. That cluster should sit at $0/hr until an explicit execution request is made, and should read the permanent stack's outputs rather than duplicating that state.
+**Why:** GPU compute is the most expensive layer of this architecture, and unlike the data platform, it should be provisioned just-in-time, not held on standby. It also depends on storage endpoints the data platform stack already owns (the lakehouse URL, the checkpoint bucket); duplicating that configuration here instead of reading it live would create two sources of truth that can quietly drift out of sync as the data stack evolves.
 
-**How:** `infra_ml_compute` reads the data stack via `pulumi.StackReference`, built dynamically so it always points at the environment currently in use:
+**How:** `infra_ml_compute` reads the data stack via `pulumi.StackReference`, built dynamically so it always points at the environment currently in use. This repo provisions a single representative training node to demonstrate the pattern — a full cluster deployment replicates this same `Pod` definition N times, each reading from the same `StackReference`:
 
 ```python
 # infra_ml_compute/__main__.py (excerpt)
@@ -140,12 +167,12 @@ Full implementation: [`infra_ml_compute/__main__.py`](./infra_ml_compute/__main_
 
 ## 6. The Failure Trap
 
-**Why:** A naive teardown on any non-zero exit code destroys the exact NVMe logs and node state an engineer needs to debug a crash. A naive *lack* of teardown on success leaves an idle $1,500+/hr - $600/hr cluster billing indefinitely.
+**Why:** Assume a 32-node (256-GPU) H100 cluster for a pretraining run. That cluster collectively bills between $1,500+/hr (on-demand) and $600/hr (aggressive committed-capacity discount) which is real cost. A blind teardown on any non-zero exit code destroys the exact NVMe contents a data scientist needs to recover a run, and the logs and live node state a devops engineer needs to debug a crash. Conversely, a blind *lack* of teardown on success leaves that idle cluster billing indefinitely.  Both of these scenarios need to be addressed.
 
-**How:** The container entrypoint checks its own exit status before deciding whether to release the node:
+**How:** The container entrypoint checks its own exit status before deciding whether to release the node. This blueprint provisions a single representative training node — a full 32-node cluster deployment replicates this same pod definition N times, with each node running this identical check independently:
 
 ```bash
-python3 -m llm_train.launch --config 70b_config.yaml
+python3 -m llm_train.launch --config training_config.yaml   # placeholders for model related assets
 STATUS=$?
 if [ $STATUS -eq 0 ]; then
     echo 'SUCCESS: Checkpoints safely pushed to AWS S3.' > /dev/termination-log
@@ -156,7 +183,18 @@ else
 fi
 ```
 
-On success, the pipeline's next step runs `pulumi destroy` immediately. On failure, it alerts and leaves the node in this hold state until someone runs the manual cleanup workflow. Full context: [`infra_ml_compute/__main__.py`](./infra_ml_compute/__main__.py).
+On success, the pipeline's next step runs `pulumi destroy` immediately. On failure, it copies the exact NVMe contents to S3, alerts, and leaves the node in this hold state until someone runs the manual cleanup workflow. Full context: [`infra_ml_compute/__main__.py`](./infra_ml_compute/__main__.py).
+
+Several assumptions/principles underpin what happens on failure:
+
+* **Identifying hang is external test script:** the trap fires on any non-zero exit — it assumes the training script itself can distinguish a true failure from ordinary slow-but-healthy progress (a long optimization step, a slow epoch) and only exits non-zero for the former. This blueprint doesn't implement that distinction; it lives in `training-model.yaml` and the training script's own error handling, neither of which is part of this repo.
+
+* **Automate data capture:** Copying the NVMe contents is a non-destructive and reversible action and this is data various teams will likely want to access and evaluate. Rather than leave this very likely step to some downstream action - be it automated or manual - it makes sense to immediately and automatically execute this upon failure.
+
+* **Scope of "failure":** the trap fires on any non-zero exit — it assumes the training script itself can distinguish a true failure from ordinary slow-but-healthy progress (a long optimization step, a slow epoch) and only exits non-zero for the former. This blueprint doesn't implement that distinction; it lives in `70b_config.yaml` and the training script's own error handling, neither of which is part of this repo.
+* **This is a data-preservation window, not a live debugging session.** By the time the trap fires, the training process has already exited — there's nothing running to attach a debugger to. The hold loop keeps the *node* alive so an engineer can retrieve forensic evidence (logs, local NVMe state) and diagnose root cause; any fix is deployed as a new run against the last good checkpoint, not applied to resume the frozen one in place. This repo also doesn't implement that resume path today — checkpoint frequency, and any logic to reload from one, live entirely in the training script's own config.
+* **The rescue copy and the destroy are deliberately separate, with different triggers.** Copying data off the node is non-destructive and reversible, so it runs automatically the moment `train.yml` detects a crash — no one has to remember to trigger it, and an engineer isn't racing a clock to rescue data before deciding whether to tear the node down. Destroying the node is irreversible, so that step stays gated behind a human running `cleanup.yml` manually, after any live inspection they want to do. `train.yml`'s automatic rescue step assumes the training script writes a checkpoint marker: it only trusts a checkpoint file as verified if a matching `.done` marker exists next to it, written by the training script *after* a confirmed-complete flush. This blueprint doesn't implement that marker-writing logic — it assumes the data science team's training code does. Without it, every rescued checkpoint file is copied to `rescue-unverified/` rather than treated as safe to resume from, since a file copied mid-write can look complete without actually being valid. Container log output and any log files the training script writes to disk are captured separately under `rescue-logs/`, classified by directory location (`/mnt/local/logs/`) rather than filename pattern — a `.done` marker doesn't mean anything for a log file the way it does for a checkpoint shard, so this blueprint also assumes the training script writes its own logs to that specific subdirectory; without that convention, log files would have no `.done` marker either and would fall into `rescue-unverified/` alongside genuinely unverified checkpoint data.
+* **This pattern doesn't extend to multi-node coordination.** Real distributed training requires all nodes to stay synchronized through a shared process group; if one node's failure trap fires, the others don't fail independently — they're already blocked waiting on it. Detecting and recovering from a single node's failure inside a live 32-node run needs a gang-scheduled job controller (e.g. Kubeflow's `PyTorchJob`), which this repo does not implement.
 
 ---
 
@@ -198,7 +236,13 @@ THE PROGRAMMATIC GITOPS LIFECYCLE
                            ▼
 [ PHASE 3 ] ────────► Stream Logs, Capture Real Exit Code
                            ├───► Exit 0 (Success) ──────► 'pulumi destroy' (Stop Billing)
-                           └───► Exit != 0 (Crash) ─────► Alert (Slack/PagerDuty) & Hold Node
+                           └───► Exit != 0 (Crash) ─────► Alert (Slack/PagerDuty)
+                                                              │
+                                                              ▼
+                                                    Auto-Rescue NVMe Data (non-destructive)
+                                                              │
+                                                              ▼
+                                              Hold Node ──► Human runs cleanup.yml when ready
 ===================================================================================
 ```
 
@@ -211,7 +255,7 @@ Four trigger modes are wired into the pipeline, each suited to a different way t
 | `schedule` / `cron` | Recurring nightly or weekend batch runs |
 | `repository_dispatch` | An upstream orchestrator (Databricks Airflow/Dagster) triggers compute as soon as data prep finishes |
 
-Full pipeline: [`.github/workflows/train.yml`](./.github/workflows/train.yml). Manual force-teardown override: [`.github/workflows/cleanup.yml`](./.github/workflows/cleanup.yml).
+Full pipeline: [`ci_staged_gh/workflows/train.yml`](./ci_staged_gh/workflows/train.yml) — includes the automatic, non-destructive data rescue on failure. Manual force-teardown override: [`ci_staged_gh/workflows/cleanup.yml`](./ci_staged_gh/workflows/cleanup.yml) — destroy only, run by a human once ready. (This folder is renamed from `.github/` to `ci_staged_gh` to avoid invoking a GitHub Action from updates to the repo — see Section 10.)
 
 ---
 
@@ -231,10 +275,10 @@ PyTorch dataloaders (via `mosaicml-streaming`) can't stream directly into GPU VR
 
 ```text
 .
-├── ci_staged_gh/                  # Rename to .github/ - changed here to avoid kicking of gh action.
+├── ci_staged_gh/                  # Rename to .github/ to activate - staged here to avoid kicking off a live GH Action.
 │   └── workflows/
-│       ├── train.yml              # Main GitOps pipeline: test-gate → deploy → monitor → destroy/alert
-│       └── cleanup.yml            # Manual force teardown as only way to release node frozen post failure trap
+│       ├── train.yml              # Main GitOps pipeline: test-gate → deploy → monitor → auto-rescue on failure → destroy/alert
+│       └── cleanup.yml            # Manual, human-triggered force-teardown of a node held by the failure trap
 ├── ESC-env-def.yaml               # Pulumi ESC central environment definition
 ├── infra_data_platform/           # PERMANENT DATA PLANE STACK
 │   ├── Pulumi.yaml
@@ -277,5 +321,5 @@ To run a test deployment:
    PYTHONPATH=. pytest infra_ml_compute/tests/
    ```
 
-3. Trigger `.github/workflows/train.yml` via the Actions tab, a push commit, the scheduled timer, or an upstream webhook dispatch.
+3. Rename `ci_staged_gh/` to `.github/` then trigger `train.yml` via the Actions tab, a push commit, the scheduled timer, or an upstream webhook dispatch.
 

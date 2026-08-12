@@ -14,7 +14,7 @@ inbound_stream_endpoint = data_platform.get_output("lakehouse_url").apply(
     lambda url: f"{url}?mode=streaming&framework=mosaic_streaming"
 )
 outbound_sync_target = data_platform.get_output("checkpoint_bucket_id").apply(
-    lambda id: f"s3://{id}/models/llama-3-custom-70b/checkpoints/"
+    lambda id: f"s3://{id}/models/training-model/checkpoints/"
 )
 
 # 2. INITIALIZE KUBERNETES WITH DYNAMIC ESC CREDENTIALS
@@ -28,9 +28,7 @@ gpu_namespace = k8s.core.v1.Namespace(
 )
 
 # 3. COREWEAVE ACCELERATED LOCAL CACHE (LOTA NVMe object storage)
-# api_version reflects CoreWeave's actual CRD group/version convention -
-# the placeholder "://coreweave.com" in the earlier draft was a stripped
-# scheme prefix and would not resolve as a valid Kubernetes API group.
+# api_version reflects CoreWeave's actual CRD group/version convention.
 coreweave_storage_bucket = k8s.apiextensions.CustomResource(
     "lota-nvme-bucket",
     api_version="objectstorage.coreweave.com/v1alpha1",
@@ -45,15 +43,12 @@ coreweave_storage_bucket = k8s.apiextensions.CustomResource(
 
 # 4. EPHEMERAL TRAINING POD WITH FAILURE TRAP
 # Uses Pulumi's typed Kubernetes SDK classes (PodSpecArgs, ContainerArgs,
-# etc.) rather than raw dicts - this is what actually gets you the
-# compile-time type checking the paper argues for. A raw-dict spec (as in
-# the earlier draft) loses that benefit entirely and reintroduces the
-# "typo caught at deploy time, not build time" problem Pulumi is meant to
-# solve.
+# etc.) for compile-time type checking to avoid
+# "typo caught at deploy time, not build time" errors.
 training_pod = k8s.core.v1.Pod(
     "h100-8x-training-node",
     metadata=k8s.meta.v1.ObjectMetaArgs(
-        name="llama3-70b-trainer",
+        name="training-model",
         namespace=gpu_namespace.metadata["name"],
         labels={"app": "llm-pretraining", "tier": "compute"},
     ),
@@ -63,12 +58,6 @@ training_pod = k8s.core.v1.Pod(
             k8s.core.v1.ContainerArgs(
                 name="mosaic-training-runner",
                 image="ghcr.io/your-org/mosaic-flash-attention:latest",
-                # Correct CoreWeave/NVIDIA device-plugin resource key.
-                # The earlier draft used "://nvidia.com", a malformed key
-                # that would fail scheduling - and its own unit test
-                # asserted that broken key was present, which is a good
-                # example of why shift-left tests must validate against a
-                # spec, not just mirror whatever the implementation wrote.
                 resources=k8s.core.v1.ResourceRequirementsArgs(
                     limits={"nvidia.com/gpu": "8", "cpu": "128", "memory": "1000Gi"},
                     requests={"nvidia.com/gpu": "8"},
@@ -81,12 +70,12 @@ training_pod = k8s.core.v1.Pod(
                         name="AWS_OUTBOUND_CHECKPOINT_BUCKET", value=outbound_sync_target
                     ),
                 ],
-                # THE SHIELD: on failure, hold the node and its local NVMe
+                # On failure, hold the node and its local NVMe
                 # cache open for inspection instead of tearing it down.
                 command=["/bin/bash", "-c"],
                 args=[
                     """
-                    python3 -m llm_train.launch --config 70b_config.yaml
+                    python3 -m llm_train.launch --config training-config.yaml
                     STATUS=$?
                     if [ $STATUS -eq 0 ]; then
                         echo 'SUCCESS: Checkpoints safely pushed to AWS S3.' > /dev/termination-log

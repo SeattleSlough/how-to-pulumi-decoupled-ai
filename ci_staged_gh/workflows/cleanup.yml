@@ -24,9 +24,8 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r infra_ml_compute/requirements.txt
 
-    # Overrides the error hold loop and destroys the ephemeral GPU compute
-    # resources immediately - use this to end an infinite-sleep debug hold
-    # once you've captured what you need from the frozen node.
+    # Data rescue already happened automatically in train.yml's failure
+    # branch. Overrides the error hold loop and destroys the ephemeral GPU compute resources.
     - name: Execute Manual Cost-Saving Destroy
       uses: pulumi/actions@v5
       with:
