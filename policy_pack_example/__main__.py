@@ -1,11 +1,9 @@
 # File: policy-pack-example/__main__.py
 #
-# EXAMPLE POLICY PACK - illustrates the *mechanism* the paper's Discovery &
-# Governance section describes (policy defined as code, evaluated during
-# `pulumi preview`/`pulumi up`, before anything deploys), NOT a statement of
-# which policies this architecture actually needs. The two policies below
-# are deliberately simple and check things this repo's own stacks already
-# do correctly - they exist to show the pattern working end-to-end, not to
+# EXAMPLE POLICY PACK - NOT a statement of which policies this architecture
+# actually needs. The two policies below are deliberately simple and check
+# things this repo's own stacks already do correctly.
+# They exist to show the pattern working end-to-end, not to
 # define your organization's real compliance posture. A production policy
 # pack would come from a pre-built compliance framework pack or your own
 # platform team, not from a how-to repo.
@@ -23,8 +21,7 @@ def s3_blocks_public_access_validator(resource, report_violation):
     (see the BucketPublicAccessBlock loop in __main__.py) - this policy
     exists to demonstrate that the check runs automatically as part of
     `pulumi preview`/`up`, not to be relied on as the only thing enforcing
-    it. It matches the paper's "advisory -> mandatory" progressive
-    enforcement idea: shown here at advisory so a real violation reports
+    it. Shown here at advisory vs mandatory so a real violation reports
     without blocking anything.
     """
     if resource.resource_type == "aws:s3/bucketPublicAccessBlock:BucketPublicAccessBlock":
