@@ -1,0 +1,581 @@
+From f89ba8b4d6581ac88e6fe2b3fc05f6be414495c7 Mon Sep 17 00:00:00 2001
+From: Claude <assistant@example.com>
+Date: Mon, 17 Aug 2026 03:47:45 +0000
+Subject: [PATCH 1/2] Align repo with paper: network encryption, TTL
+ kill-clock, example policy pack
+
+- infra_data_platform: add aws.directconnect.Connection with MACsec
+  (request_macsec + must_encrypt) on the AWS-facing hop of the Megaport
+  bridge - Megaport's Vxc resource has no encryption property of its own,
+  so this is the actual mechanism behind the paper's 'encrypted end-to-end
+  by the primary cloud provider' claim.
+
+- infra_ml_compute: add pulumiservice.TtlSchedule (+ required
+  DeploymentSettings) as a fixed-duration kill-clock. Closes the gap where
+  a silently-hung workload (no crash, no exit code) was never reclaimed -
+  the existing failure trap only fires on a non-zero exit. Extension based
+  on an in-container health signal is documented as an explicit,
+  unimplemented extension point (same pattern as the existing .done-marker
+  assumption), not built here.
+
+- policy-pack-example/: new minimal PolicyPack (S3 public-access block,
+  GPU pod resource limits) wired into train.yml via
+  `pulumi up --policy-pack`, demonstrating the paper's shift-left policy
+  mechanism. Explicitly marked illustrative, not a compliance statement -
+  both example policies check things the repo's stacks already do
+  correctly.
+
+- README: documents all three additions in place, updates the pipeline
+  diagram and repo structure tree accordingly.
+---
+ README.md                             | 68 ++++++++++++++++++--
+ ci_staged_gh/workflows/train.yml      | 19 +++---
+ infra_data_platform/__main__.py       | 32 ++++++++--
+ infra_data_platform/requirements.txt  |  4 ++
+ infra_ml_compute/__main__.py          | 68 +++++++++++++++++++-
+ infra_ml_compute/requirements.txt     |  4 ++
+ policy-pack-example/PulumiPolicy.yaml |  8 +++
+ policy-pack-example/__main__.py       | 89 +++++++++++++++++++++++++++
+ policy-pack-example/requirements.txt  |  2 +
+ 9 files changed, 276 insertions(+), 18 deletions(-)
+ create mode 100644 policy-pack-example/PulumiPolicy.yaml
+ create mode 100644 policy-pack-example/__main__.py
+ create mode 100644 policy-pack-example/requirements.txt
+
+diff --git a/README.md b/README.md
+index 0b18f6c..1b7d958 100644
+--- a/README.md
++++ b/README.md
+@@ -16,8 +16,8 @@ By uncoupling your data lakehouse from your compute engine, you maintain enterpr
+
+ * **Zero Static Keys:** Dynamic OIDC token federation using **Pulumi ESC**.
+ * **Isolated Cloud Lifecycles:** Decoupled stacks using **Pulumi Stack References** to separate long-lived storage from ephemeral hardware.
+-* **Runaway Cost Prevention:** Programmatic failure traps and automated lifecycle teardowns to prevent $0/hour compute states from idling when jobs fail or complete.
+-* **A Real Cross-Cloud Network Path:** A Megaport private circuit between AWS and CoreWeave, provisioned as part of the permanent data plane — not assumed to exist.
++* **Runaway Cost Prevention:** Programmatic failure traps for explicit crashes, plus a separate TTL kill-clock (Section 6a) that bounds the cost of a workload that hangs silently with no error at all.
++* **A Real, Encrypted Cross-Cloud Network Path:** A Megaport private circuit between AWS and CoreWeave, with MACsec encryption enforced on the AWS-facing hop — provisioned as part of the permanent data plane, not assumed to exist.
+
+ ---
+
+@@ -128,6 +128,25 @@ aws.s3.BucketLifecycleConfigurationV2(
+
+ Full implementation: [`infra_data_platform/__main__.py`](./infra_data_platform/__main__.py).
+
++### Encrypting the AWS-Facing Hop of the Bridge
++
++**Why:** A private circuit isn't the same claim as an encrypted one. Megaport's `Vxc` resource has no encryption property of its own — MACsec is a physical-link-layer feature configured on the AWS Direct Connect connection itself, not something Megaport's SDN exposes.
++
++**How:** `aws.directconnect.Connection` is provisioned with `request_macsec=True` and `encryption_mode="must_encrypt"`, so AWS terminates and enforces encryption on its end; Megaport's circuit carries the already-encrypted frames transparently:
++
++```python
++# infra_data_platform/__main__.py (excerpt)
++aws_dx_connection = aws.directconnect.Connection(
++    "aws-coreweave-dx-connection",
++    bandwidth="10Gbps",  # MACsec requires a dedicated 10Gbps+ connection
++    location="EqDA2",
++    request_macsec=True,
++    encryption_mode="must_encrypt",
++)
++```
++
++This is a real physical link, not something a single `pulumi up` fully activates: MACsec is only available at select Direct Connect locations, and `encryption_mode` only takes effect once the connection reaches an "Available" state after its physical cross-connect is installed at a colocation facility.
++
+ ---
+
+ ## 5. Ephemeral Compute Plane
+@@ -198,6 +217,32 @@ Several assumptions/principles underpin what happens on failure:
+
+ ---
+
++## 6a. TTL Kill-Clock: Bounding the Cost of a Silent Hang
++
++**Why:** The failure trap in Section 6 only fires when the training script itself exits non-zero — a genuine crash. It does nothing for the harder, more expensive case: a process that never exits at all, stuck with no error to report. Nothing upstream — not the failure trap, not `train.yml`'s `kubectl logs -f` step — can distinguish that from a slow-but-healthy run, so nothing reclaims it, and the cluster keeps billing.
++
++**How:** `pulumiservice.TtlSchedule` — a real Pulumi Cloud resource, not custom code — schedules an automatic destroy N hours after deploy, regardless of the pod's state at that point:
++
++```python
++# infra_ml_compute/__main__.py (excerpt)
++ttl_schedule = pulumiservice.TtlSchedule(
++    "training-node-ttl",
++    organization=pulumi.get_organization(),
++    project=pulumi.get_project(),
++    stack=pulumi.get_stack(),
++    timestamp=destroy_at,  # now + ttlHours, computed at deploy time
++    delete_after_destroy=False,
++)
++```
++
++`TtlSchedule` executes on Pulumi's own hosted runners (Pulumi Deployments) rather than this repo's GitHub Actions, so the kill-clock still fires even if the GitHub Actions run that created it has long since finished — which is also why `pulumiservice.DeploymentSettings` has to be configured first; see the comments in `infra_ml_compute/__main__.py` for the full prerequisite chain.
++
++**What this deliberately doesn't do:** extend the clock for a run that's still legitimately healthy past that window. Doing that safely needs a health signal from inside the training process — a heartbeat file, a liveness check tied to real training progress — that this blueprint doesn't implement, the same category of assumption as the `.done` checkpoint marker in Section 6: it depends on data-science-side instrumentation this repo doesn't own. If you add that signal, the extension pattern is a second scheduled step that reads it and, when healthy, calls the Pulumi Cloud Schedules API's TTL update endpoint to push `destroy_at` forward using this resource's `schedule_id` output.
++
++Full implementation: [`infra_ml_compute/__main__.py`](./infra_ml_compute/__main__.py).
++
++---
++
+ ## 7. Shift-Left Unit Verification
+
+ **Why:** A syntax error, a malformed resource key, or a missing variable shouldn't trigger an expensive hardware allocation to discover.
+@@ -216,6 +261,12 @@ def test_gpu_resource_limits_are_correct(self):
+
+ This test exists because an earlier draft of this stack used a malformed key (`"://nvidia.com"`) that would have failed at deploy time — and had a test that asserted the broken value instead of catching it. Full test suite: [`infra_ml_compute/tests/test_ml_compute.py`](./infra_ml_compute/tests/test_ml_compute.py), [`infra_data_platform/tests/test_data_platform.py`](./infra_data_platform/tests/test_data_platform.py).
+
++### Shift-Left Policy Enforcement (Example)
++
++**Why:** Unit tests validate a stack against *its own* expectations — they only catch what someone thought to assert. Policy-as-code validates a stack against organization-wide rules, evaluated automatically during `preview`/`up`, regardless of whether the person writing that particular stack knew the rule existed.
++
++**How:** [`policy-pack-example/`](./policy-pack-example/) is a minimal `PolicyPack` wired into `train.yml` via `pulumi up --policy-pack ../policy-pack-example`. **This pack is illustrative, not prescriptive** — its two policies (S3 public-access blocking, GPU pod resource limits) deliberately check things this repo's stacks already do correctly, to demonstrate the mechanism working end-to-end. It is not a statement of what policies a real deployment of this architecture needs; a production policy pack would come from a pre-built compliance framework or your platform team, not a how-to repo. See the docstrings in [`policy-pack-example/__main__.py`](./policy-pack-example/__main__.py) for the reasoning behind each example policy.
++
+ ---
+
+ ## 8. GitOps Lifecycle Orchestration
+@@ -232,7 +283,8 @@ THE PROGRAMMATIC GITOPS LIFECYCLE
+                            ▼
+ [ PHASE 1 ] ────────► Shift-Left Validation (pytest + set_mocks)      [ Pass: $0 Spent ]
+                            ▼
+-[ PHASE 2 ] ────────► Provision Ephemeral Stack (CoreWeave H100 Pod JIT Spin-up)
++[ PHASE 2 ] ────────► Provision Ephemeral Stack (policy-checked `pulumi up`,
++                       CoreWeave H100 Pod JIT Spin-up + TTL kill-clock attached)
+                            ▼
+ [ PHASE 3 ] ────────► Stream Logs, Capture Real Exit Code
+                            ├───► Exit 0 (Success) ──────► 'pulumi destroy' (Stop Billing)
+@@ -277,14 +329,18 @@ PyTorch dataloaders (via `mosaicml-streaming`) can't stream directly into GPU VR
+ .
+ ├── ci_staged_gh/                  # Rename to .github/ to activate - staged here to avoid kicking off a live GH Action.
+ │   └── workflows/
+-│       ├── train.yml              # Main GitOps pipeline: test-gate → deploy → monitor → auto-rescue on failure → destroy/alert
++│       ├── train.yml              # Main GitOps pipeline: test-gate → policy-checked deploy → monitor → auto-rescue on failure → destroy/alert
+ │       └── cleanup.yml            # Manual, human-triggered force-teardown of a node held by the failure trap
+ ├── ESC-env-def.yaml               # Pulumi ESC central environment definition
++├── policy-pack-example/           # ILLUSTRATIVE example policy pack (not prescriptive - see Section 7)
++│   ├── PulumiPolicy.yaml
++│   ├── __main__.py
++│   └── requirements.txt
+ ├── infra_data_platform/           # PERMANENT DATA PLANE STACK
+ │   ├── Pulumi.yaml
+ │   ├── Pulumi.production.yaml
+ │   ├── __init__.py
+-│   ├── __main__.py                # AWS VPC, S3 buckets, Databricks workspace, Megaport bridge
++│   ├── __main__.py                # AWS VPC, S3 buckets, Databricks workspace, Megaport bridge + MACsec
+ │   ├── requirements.txt
+ │   └── tests/
+ │       ├── __init__.py
+@@ -293,7 +349,7 @@ PyTorch dataloaders (via `mosaicml-streaming`) can't stream directly into GPU VR
+     ├── Pulumi.yaml
+     ├── Pulumi.production.yaml
+     ├── __init__.py
+-    ├── __main__.py                 # CoreWeave K8s provider, NVMe cache bucket, pod with failure trap
++    ├── __main__.py                 # CoreWeave K8s provider, NVMe cache bucket, pod with failure trap, TTL kill-clock
+     ├── requirements.txt
+     └── tests/
+         ├── __init__.py
+diff --git a/ci_staged_gh/workflows/train.yml b/ci_staged_gh/workflows/train.yml
+index 0e5c0cc..6a0c51c 100644
+--- a/ci_staged_gh/workflows/train.yml
++++ b/ci_staged_gh/workflows/train.yml
+@@ -76,14 +76,19 @@ jobs:
+       run: |
+         python -m pip install --upgrade pip
+         pip install -r infra_ml_compute/requirements.txt
+-
+-    - name: Provision Ephemeral CoreWeave Compute
++        pip install -r policy-pack-example/requirements.txt
++
++    # Runs as a plain CLI step (not the pulumi/actions "up" command) so the
++    # policy-pack flag stays visible and readable rather than depending on
++    # whatever policy-pack input syntax a given action version supports.
++    # This is the example pack from policy-pack-example/ - see that
++    # directory's __main__.py for why it's illustrative, not prescriptive.
++    - name: Provision Ephemeral CoreWeave Compute (policy-checked)
+       id: pulumi_up
+-      uses: pulumi/actions@v5
+-      with:
+-        command: up
+-        stack-name: production
+-        work-dir: infra_ml_compute
++      working-directory: infra_ml_compute
++      run: |
++        pulumi stack select production
++        pulumi up --yes --policy-pack ../policy-pack-example
+       env:
+         PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+
+diff --git a/infra_data_platform/__main__.py b/infra_data_platform/__main__.py
+index 2dddf17..6e77edb 100644
+--- a/infra_data_platform/__main__.py
++++ b/infra_data_platform/__main__.py
+@@ -73,10 +73,10 @@ external_data_volume = databricks.ExternalLocation(
+ )
+
+ # 4. CROSS-CLOUD NETWORK BRIDGE (AWS <-> CoreWeave)
+-# This is the physical private circuit the architecture diagram's "encrypted
+-# network" arrow depends on. Without it, the compute stack has no defined
+-# path back to this stack's storage - it's provisioned here, once, as a
+-# permanent asset, and referenced (not recreated) by the ephemeral stack.
++# This is the physical private circuit the architecture diagram's network
++# arrow depends on. Without it, the compute stack has no defined path back
++# to this stack's storage - it's provisioned here, once, as a permanent
++# asset, and referenced (not recreated) by the ephemeral stack.
+ megaport_provider = megaport.Provider("mp-provider", api_token=megaport_token)
+
+ cross_cloud_bridge = megaport.Vxc(
+@@ -87,6 +87,30 @@ cross_cloud_bridge = megaport.Vxc(
+     opts=pulumi.ResourceOptions(provider=megaport_provider),
+ )
+
++# ENCRYPTION FOR THE AWS-FACING HOP OF THE BRIDGE
++# Megaport's Vxc resource has no encryption property of its own - MACsec is
++# a physical-link-layer feature configured on the AWS Direct Connect
++# connection itself, not something Megaport's SDN exposes. This is the
++# concrete mechanism behind this stack's encrypted-network requirement: AWS
++# terminates and enforces the encryption; Megaport's circuit just carries
++# the already-encrypted frames transparently between the two connection
++# points. request_macsec provisions the connection with MACsec capability;
++# encryption_mode="must_encrypt" enforces encryption rather than merely
++# allowing it. Note this is a real physical link: MACsec requires a
++# dedicated 10Gbps+ connection, is only available at select Direct Connect
++# locations, and encryption_mode only takes effect once the connection
++# reaches an "Available" state after its physical cross-connect is
++# installed - this isn't something a single `pulumi up` completes
++# end-to-end without a real colocation facility behind it.
++aws_dx_connection = aws.directconnect.Connection(
++    "aws-coreweave-dx-connection",
++    name="aws-coreweave-macsec-link",
++    bandwidth="10Gbps",
++    location="EqDA2",  # placeholder Direct Connect location - replace with yours
++    request_macsec=True,
++    encryption_mode="must_encrypt",
++)
++
+ # STACK EXPORTS
+ # NOTE: project name here ("data-platform") must match the `name:` field in
+ # this stack's Pulumi.yaml - the compute stack's StackReference resolves
+diff --git a/infra_data_platform/requirements.txt b/infra_data_platform/requirements.txt
+index cb4c948..44ace9e 100644
+--- a/infra_data_platform/requirements.txt
++++ b/infra_data_platform/requirements.txt
+@@ -5,3 +5,7 @@ pulumi>=3.0.0,<4.0.0
+ pulumi-aws>=6.0.0,<7.0.0
+ pulumi-databricks>=1.0.0,<2.0.0
+ pulumi-megaport>=0.5.0,<1.0.0
++
++# aws.directconnect.Connection (MACsec encryption on the AWS-facing hop of
++# the cross-cloud bridge) already ships in pulumi-aws above - no separate
++# package needed.
+diff --git a/infra_ml_compute/__main__.py b/infra_ml_compute/__main__.py
+index ab96879..8bb09a0 100644
+--- a/infra_ml_compute/__main__.py
++++ b/infra_ml_compute/__main__.py
+@@ -1,6 +1,8 @@
+ # File: infra_ml_compute/__main__.py
++import datetime
+ import pulumi
+ import pulumi_kubernetes as k8s
++import pulumi_pulumiservice as pulumiservice
+
+ # 1. READ PERMANENT STATE VIA STACK REFERENCE
+ # Built dynamically from the current stack name (not hardcoded to
+@@ -101,4 +103,68 @@ training_pod = k8s.core.v1.Pod(
+     opts=pulumi.ResourceOptions(provider=coreweave_provider, depends_on=[coreweave_storage_bucket]),
+ )
+
+-pulumi.export("active_compute_pod", training_pod.metadata.apply(lambda m: m.get("name") if m else None))
+\ No newline at end of file
++# 5. TTL KILL-CLOCK (bounds the cost of a silent hang)
++# The failure trap above only fires when the training script itself exits
++# non-zero - a genuine crash. It does nothing for the harder case: a
++# process that never exits at all (stuck in a bad state with no error to
++# report). Nothing upstream of this - not the failure trap, not train.yml's
++# `kubectl logs -f` step - has any way to distinguish that from a slow but
++# healthy run, so nothing reclaims it. This is a hard, fixed-duration
++# kill-clock: the stack is scheduled for automatic destroy N hours from
++# whenever this deploy runs, no matter what state the pod is in then.
++#
++# What this deliberately does NOT do: extend the clock for a run that's
++# still legitimately healthy and working past that window. Doing that
++# safely requires a health signal from inside the training process itself
++# (a heartbeat file, a liveness probe tied to real training progress, a
++# custom metric) that this blueprint doesn't implement - the same category
++# of assumption as the checkpoint `.done` marker in Section 6: it depends
++# on data-science-side instrumentation this repo doesn't own. If you add
++# that heartbeat, the extension pattern is a second scheduled step
++# (Kubernetes CronJob, or a script call) that reads the health signal and,
++# if healthy, calls the Pulumi Cloud Schedules API's TTL update endpoint
++# (POST .../deployments/ttl/schedules/{scheduleID}) to push destroy_at
++# forward using this schedule's id output below.
++ttl_hours = config.get_int("ttlHours") or 8  # override via `pulumi config set ttlHours <n>`
++destroy_at = (
++    datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=ttl_hours)
++).strftime("%Y-%m-%dT%H:%M:%S.000Z")
++
++# TtlSchedule executes on Pulumi's own hosted runners (Pulumi Deployments),
++# not this repo's GitHub Actions - a separate execution path from train.yml
++# and cleanup.yml, needed so the kill-clock still fires even if the GitHub
++# Actions run that created it has long since finished. Deployment settings
++# (which repo/branch/work-dir Pulumi Deployments should check out to run
++# the eventual `pulumi destroy`) have to exist before a TTL schedule can be
++# attached - without this, TtlSchedule creation fails outright.
++deployment_settings = pulumiservice.DeploymentSettings(
++    "training-node-deployment-settings",
++    organization=pulumi.get_organization(),
++    project=pulumi.get_project(),
++    stack=pulumi.get_stack(),
++    source_context={
++        "git": {
++            "repo_url": "https://github.com/your-org/how-to-pulumi-decoupled-ai.git",
++            "branch": "refs/heads/main",
++        },
++    },
++    operation_context={
++        "pre_run_commands": [],
++        "environment_variables": {},
++    },
++)
++
++ttl_schedule = pulumiservice.TtlSchedule(
++    "training-node-ttl",
++    organization=pulumi.get_organization(),
++    project=pulumi.get_project(),
++    stack=pulumi.get_stack(),
++    timestamp=destroy_at,
++    # Do not also delete the stack record itself - just the resources. The
++    # stack (and its Drift/TTL history) should persist for the next run.
++    delete_after_destroy=False,
++    opts=pulumi.ResourceOptions(depends_on=[training_pod, deployment_settings]),
++)
++
++pulumi.export("active_compute_pod", training_pod.metadata.apply(lambda m: m.get("name") if m else None))
++pulumi.export("ttl_destroy_at", destroy_at)
+\ No newline at end of file
+diff --git a/infra_ml_compute/requirements.txt b/infra_ml_compute/requirements.txt
+index 90aa0aa..b7d393e 100644
+--- a/infra_ml_compute/requirements.txt
++++ b/infra_ml_compute/requirements.txt
+@@ -3,3 +3,7 @@ pulumi>=3.0.0,<4.0.0
+
+ # Kubernetes Cluster & Object Storage Provider
+ pulumi-kubernetes>=4.0.0,<5.0.0
++
++# Pulumi Cloud constructs (TtlSchedule, DeploymentSettings) for the
++# TTL kill-clock - manages Pulumi Cloud itself as IaC, not cloud resources.
++pulumi-pulumiservice>=0.30.0,<1.0.0
+diff --git a/policy-pack-example/PulumiPolicy.yaml b/policy-pack-example/PulumiPolicy.yaml
+new file mode 100644
+index 0000000..a854f86
+--- /dev/null
++++ b/policy-pack-example/PulumiPolicy.yaml
+@@ -0,0 +1,8 @@
++# yaml-language-server: $schema=none
++
++runtime: python
++name: decoupled-ai-example-policies
++description: >
++  Illustrative example policy pack - demonstrates the shift-left policy
++  mechanism referenced in the paper, not a definitive compliance policy
++  set for this architecture. See __main__.py for details.
+diff --git a/policy-pack-example/__main__.py b/policy-pack-example/__main__.py
+new file mode 100644
+index 0000000..792c66a
+--- /dev/null
++++ b/policy-pack-example/__main__.py
+@@ -0,0 +1,89 @@
++# File: policy-pack-example/__main__.py
++#
++# EXAMPLE POLICY PACK - illustrates the *mechanism* the paper's Discovery &
++# Governance section describes (policy defined as code, evaluated during
++# `pulumi preview`/`pulumi up`, before anything deploys), NOT a statement of
++# which policies this architecture actually needs. The two policies below
++# are deliberately simple and check things this repo's own stacks already
++# do correctly - they exist to show the pattern working end-to-end, not to
++# define your organization's real compliance posture. A production policy
++# pack would come from a pre-built compliance framework pack or your own
++# platform team, not from a how-to repo.
++from pulumi_policy import (
++    EnforcementLevel,
++    PolicyPack,
++    ResourceValidationPolicy,
++)
++
++
++def s3_blocks_public_access_validator(resource, report_violation):
++    """Requires S3 buckets to explicitly block public access.
++
++    infra_data_platform already does this for both buckets it creates
++    (see the BucketPublicAccessBlock loop in __main__.py) - this policy
++    exists to demonstrate that the check runs automatically as part of
++    `pulumi preview`/`up`, not to be relied on as the only thing enforcing
++    it. It matches the paper's "advisory -> mandatory" progressive
++    enforcement idea: shown here at advisory so a real violation reports
++    without blocking anything.
++    """
++    if resource.resource_type == "aws:s3/bucketPublicAccessBlock:BucketPublicAccessBlock":
++        props = resource.props
++        required_true = (
++            "blockPublicAcls",
++            "blockPublicPolicy",
++            "ignorePublicAcls",
++            "restrictPublicBuckets",
++        )
++        missing = [key for key in required_true if not props.get(key)]
++        if missing:
++            report_violation(
++                f"S3 bucket public-access-block settings must all be true; "
++                f"missing/false: {', '.join(missing)}."
++            )
++
++
++def gpu_pod_requires_resource_limits_validator(resource, report_violation):
++    """Requires GPU training pods to declare explicit resource limits.
++
++    infra_ml_compute's training_pod already sets nvidia.com/gpu, cpu, and
++    memory limits - see the resource_limits test in
++    infra_ml_compute/tests/test_ml_compute.py, which checks the same thing
++    at the pytest/mocks layer. This policy checks the same property at the
++    infrastructure-policy layer instead, to show the two mechanisms are
++    complementary, not redundant: pytest validates your own resource graph
++    against your own expectations before anything deploys; a policy pack
++    validates configuration against an organization-wide rule regardless of
++    who wrote the Pulumi program or whether they knew the rule existed.
++    """
++    if resource.resource_type == "kubernetes:core/v1:Pod":
++        containers = (resource.props.get("spec") or {}).get("containers") or []
++        for container in containers:
++            limits = (container.get("resources") or {}).get("limits")
++            if not limits:
++                report_violation(
++                    f"Container '{container.get('name', '<unnamed>')}' must "
++                    f"declare resource limits."
++                )
++
++
++s3_blocks_public_access = ResourceValidationPolicy(
++    name="s3-blocks-public-access",
++    description="S3 buckets must block public access explicitly.",
++    validate=s3_blocks_public_access_validator,
++)
++
++gpu_pod_requires_resource_limits = ResourceValidationPolicy(
++    name="gpu-pod-requires-resource-limits",
++    description="GPU training pods must declare explicit resource limits.",
++    validate=gpu_pod_requires_resource_limits_validator,
++)
++
++PolicyPack(
++    name="decoupled-ai-example-policies",
++    enforcement_level=EnforcementLevel.ADVISORY,
++    policies=[
++        s3_blocks_public_access,
++        gpu_pod_requires_resource_limits,
++    ],
++)
+diff --git a/policy-pack-example/requirements.txt b/policy-pack-example/requirements.txt
+new file mode 100644
+index 0000000..4b6ea12
+--- /dev/null
++++ b/policy-pack-example/requirements.txt
+@@ -0,0 +1,2 @@
++pulumi>=3.0.0,<4.0.0
++pulumi-policy>=1.0.0,<2.0.0
+--
+2.43.0
+
+
+From ff89bd05498bc699dab14e7b6cbabfd9db40fbe1 Mon Sep 17 00:00:00 2001
+From: Claude <assistant@example.com>
+Date: Mon, 17 Aug 2026 04:03:30 +0000
+Subject: [PATCH 2/2] Make TTL kill-clock tie-in visible in train.yml
+
+Previously the TTL kill-clock existed only as a resource declaration in
+infra_ml_compute/__main__.py - nothing in train.yml itself referenced it,
+so reading the pipeline top to bottom gave no indication it existed.
+
+- Add a comment at the provisioning step explaining the TTL schedule is
+  created as a side effect of that same `pulumi up`, not a separate step.
+- Add a 'Report TTL Kill-Clock' step that reads the ttl_destroy_at stack
+  output and writes it to the job summary, so the destroy time is visible
+  per-run rather than only discoverable by reading __main__.py.
+- Surface the same destroy time in the Slack crash alert, since it directly
+  affects what an engineer inspecting a held-open crashed node needs to
+  know: the failure trap's hold-open state is not exempt from the TTL - if
+  cleanup.yml isn't run before the TTL fires, the node (and its forensic
+  NVMe state) gets reclaimed anyway.
+- README: document this TTL/failure-trap interaction explicitly in the
+  TTL Kill-Clock section (6a), since it wasn't called out anywhere before.
+---
+ README.md                        |  2 ++
+ ci_staged_gh/workflows/train.yml | 25 ++++++++++++++++++++++++-
+ 2 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/README.md b/README.md
+index 1b7d958..b54ebf5 100644
+--- a/README.md
++++ b/README.md
+@@ -241,6 +241,8 @@ ttl_schedule = pulumiservice.TtlSchedule(
+
+ Full implementation: [`infra_ml_compute/__main__.py`](./infra_ml_compute/__main__.py).
+
++**Interaction with the failure trap (Section 6) worth knowing:** the TTL kill-clock has no awareness of *why* a node is still running — it fires at its scheduled time whether the pod is healthy, hung, or deliberately held open by the failure trap for crash forensics. If an engineer doesn't run `cleanup.yml` before the TTL expires, Pulumi Cloud destroys the node anyway, taking the held-open NVMe state and live node access with it. The TTL bounds cost; it does not defer to an in-progress human investigation. If that's not the behavior you want, either set `ttlHours` generously enough to cover a realistic inspection window, or extend `cleanup.yml`/the TTL schedule to cancel or push back the clock as soon as a human starts investigating a crash - this repo doesn't implement that coordination.
++
+ ---
+
+ ## 7. Shift-Left Unit Verification
+diff --git a/ci_staged_gh/workflows/train.yml b/ci_staged_gh/workflows/train.yml
+index 6a0c51c..35a0b22 100644
+--- a/ci_staged_gh/workflows/train.yml
++++ b/ci_staged_gh/workflows/train.yml
+@@ -83,6 +83,13 @@ jobs:
+     # whatever policy-pack input syntax a given action version supports.
+     # This is the example pack from policy-pack-example/ - see that
+     # directory's __main__.py for why it's illustrative, not prescriptive.
++    #
++    # This same `pulumi up` also creates the TTL kill-clock declared in
++    # infra_ml_compute/__main__.py (pulumiservice.TtlSchedule) - it's not a
++    # separate step because it's just another resource in that stack, not
++    # something train.yml calls directly. The next step surfaces the
++    # resulting destroy time so it's actually visible from this pipeline
++    # rather than only discoverable by reading __main__.py.
+     - name: Provision Ephemeral CoreWeave Compute (policy-checked)
+       id: pulumi_up
+       working-directory: infra_ml_compute
+@@ -92,6 +99,20 @@ jobs:
+       env:
+         PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+
++    # Surfaces the TTL kill-clock's destroy time set by the step above, so
++    # anyone watching this run can see when the hard reclaim will fire
++    # without having to go find the TtlSchedule resource in __main__.py.
++    - name: Report TTL Kill-Clock
++      id: ttl_report
++      working-directory: infra_ml_compute
++      run: |
++        TTL_DESTROY_AT=$(pulumi stack output ttl_destroy_at)
++        echo "destroy_at=$TTL_DESTROY_AT" >> "$GITHUB_OUTPUT"
++        echo "### TTL Kill-Clock" >> "$GITHUB_STEP_SUMMARY"
++        echo "This stack will be automatically destroyed at **${TTL_DESTROY_AT}** if not torn down sooner (crash, or a successful run's normal teardown)." >> "$GITHUB_STEP_SUMMARY"
++      env:
++        PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
++
+     - name: Stream Training Logs & Capture Exit Code
+       id: monitor
+       run: |
+@@ -118,7 +139,7 @@ jobs:
+       if: failure() && steps.monitor.outcome == 'failure'
+       run: |
+         curl -X POST -H 'Content-type: application/json' \
+-          --data '{"text":"🚨 *ML Cluster Crash Alert*: `training-model` failed. Compute node and NVMe local storage are frozen for engineering inspection. Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' \
++          --data '{"text":"🚨 *ML Cluster Crash Alert*: `training-model` failed. Compute node and NVMe local storage are frozen for engineering inspection. Node will still be auto-reclaimed by its TTL kill-clock at '"${TTL_DESTROY_AT}"' if nobody runs cleanup.yml first. Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' \
+           "${{ secrets.SLACK_WEBHOOK_URL }}"
+
+         curl -X POST "${{ secrets.PAGERDUTY_EVENTS_URL }}" \
+@@ -132,6 +153,8 @@ jobs:
+               "severity": "critical"
+             }
+           }'
++      env:
++        TTL_DESTROY_AT: ${{ steps.ttl_report.outputs.destroy_at }}
+
+     # Runs automatically on failure.
+     # Files under a /logs/ subdirectory are copied to rescue-logs/.
+--
+2.43.0
+

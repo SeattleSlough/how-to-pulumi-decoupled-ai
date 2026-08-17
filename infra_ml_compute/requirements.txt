@@ -7,3 +7,4 @@ pulumi-kubernetes>=4.0.0,<5.0.0
 # Pulumi Cloud constructs (TtlSchedule, DeploymentSettings) for the
 # TTL kill-clock - manages Pulumi Cloud itself as IaC, not cloud resources.
 pulumi-pulumiservice>=0.30.0,<1.0.0
+
