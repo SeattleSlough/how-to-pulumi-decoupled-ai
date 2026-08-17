@@ -73,10 +73,10 @@ external_data_volume = databricks.ExternalLocation(
 )
 
 # 4. CROSS-CLOUD NETWORK BRIDGE (AWS <-> CoreWeave)
-# This is the physical private circuit the architecture diagram's "encrypted
-# network" arrow depends on. Without it, the compute stack has no defined
-# path back to this stack's storage - it's provisioned here, once, as a
-# permanent asset, and referenced (not recreated) by the ephemeral stack.
+# This is the physical private circuit the architecture diagram's network
+# arrow depends on. Without it, the compute stack has no defined path back
+# to this stack's storage - it's provisioned here, once, as a permanent
+# asset, and referenced (not recreated) by the ephemeral stack.
 megaport_provider = megaport.Provider("mp-provider", api_token=megaport_token)
 
 cross_cloud_bridge = megaport.Vxc(
@@ -85,6 +85,30 @@ cross_cloud_bridge = megaport.Vxc(
     a_end_mcr_id="your-aws-direct-connect-gateway-id",
     b_end_mcr_id="coreweave-datacenter-pop-id",
     opts=pulumi.ResourceOptions(provider=megaport_provider),
+)
+
+# ENCRYPTION FOR THE AWS-FACING HOP OF THE BRIDGE
+# Megaport's Vxc resource has no encryption property of its own - MACsec is
+# a physical-link-layer feature configured on the AWS Direct Connect
+# connection itself, not something Megaport's SDN exposes. This is the
+# concrete mechanism behind this stack's encrypted-network requirement: AWS
+# terminates and enforces the encryption; Megaport's circuit just carries
+# the already-encrypted frames transparently between the two connection
+# points. request_macsec provisions the connection with MACsec capability;
+# encryption_mode="must_encrypt" enforces encryption rather than merely
+# allowing it. Note this is a real physical link: MACsec requires a
+# dedicated 10Gbps+ connection, is only available at select Direct Connect
+# locations, and encryption_mode only takes effect once the connection
+# reaches an "Available" state after its physical cross-connect is
+# installed - this isn't something a single `pulumi up` completes
+# end-to-end without a real colocation facility behind it.
+aws_dx_connection = aws.directconnect.Connection(
+    "aws-coreweave-dx-connection",
+    name="aws-coreweave-macsec-link",
+    bandwidth="10Gbps",
+    location="EqDA2",  # placeholder Direct Connect location - replace with yours
+    request_macsec=True,
+    encryption_mode="must_encrypt",
 )
 
 # STACK EXPORTS

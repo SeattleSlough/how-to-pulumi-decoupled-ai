@@ -5,3 +5,7 @@ pulumi>=3.0.0,<4.0.0
 pulumi-aws>=6.0.0,<7.0.0
 pulumi-databricks>=1.0.0,<2.0.0
 pulumi-megaport>=0.5.0,<1.0.0
+
+# aws.directconnect.Connection (MACsec encryption on the AWS-facing hop of
+# the cross-cloud bridge) already ships in pulumi-aws above - no separate
+# package needed.

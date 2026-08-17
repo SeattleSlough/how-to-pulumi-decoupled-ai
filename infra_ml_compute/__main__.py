@@ -1,6 +1,8 @@
 # File: infra_ml_compute/__main__.py
+import datetime
 import pulumi
 import pulumi_kubernetes as k8s
+import pulumi_pulumiservice as pulumiservice
 
 # 1. READ PERMANENT STATE VIA STACK REFERENCE
 # Built dynamically from the current stack name (not hardcoded to
@@ -101,4 +103,68 @@ training_pod = k8s.core.v1.Pod(
     opts=pulumi.ResourceOptions(provider=coreweave_provider, depends_on=[coreweave_storage_bucket]),
 )
 
+# 5. TTL KILL-CLOCK (bounds the cost of a silent hang)
+# The failure trap above only fires when the training script itself exits
+# non-zero - a genuine crash. It does nothing for the harder case: a
+# process that never exits at all (stuck in a bad state with no error to
+# report). Nothing upstream of this - not the failure trap, not train.yml's
+# `kubectl logs -f` step - has any way to distinguish that from a slow but
+# healthy run, so nothing reclaims it. This is a hard, fixed-duration
+# kill-clock: the stack is scheduled for automatic destroy N hours from
+# whenever this deploy runs, no matter what state the pod is in then.
+#
+# What this deliberately does NOT do: extend the clock for a run that's
+# still legitimately healthy and working past that window. Doing that
+# safely requires a health signal from inside the training process itself
+# (a heartbeat file, a liveness probe tied to real training progress, a
+# custom metric) that this blueprint doesn't implement - the same category
+# of assumption as the checkpoint `.done` marker in Section 6: it depends
+# on data-science-side instrumentation this repo doesn't own. If you add
+# that heartbeat, the extension pattern is a second scheduled step
+# (Kubernetes CronJob, or a script call) that reads the health signal and,
+# if healthy, calls the Pulumi Cloud Schedules API's TTL update endpoint
+# (POST .../deployments/ttl/schedules/{scheduleID}) to push destroy_at
+# forward using this schedule's id output below.
+ttl_hours = config.get_int("ttlHours") or 8  # override via `pulumi config set ttlHours <n>`
+destroy_at = (
+    datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=ttl_hours)
+).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+# TtlSchedule executes on Pulumi's own hosted runners (Pulumi Deployments),
+# not this repo's GitHub Actions - a separate execution path from train.yml
+# and cleanup.yml, needed so the kill-clock still fires even if the GitHub
+# Actions run that created it has long since finished. Deployment settings
+# (which repo/branch/work-dir Pulumi Deployments should check out to run
+# the eventual `pulumi destroy`) have to exist before a TTL schedule can be
+# attached - without this, TtlSchedule creation fails outright.
+deployment_settings = pulumiservice.DeploymentSettings(
+    "training-node-deployment-settings",
+    organization=pulumi.get_organization(),
+    project=pulumi.get_project(),
+    stack=pulumi.get_stack(),
+    source_context={
+        "git": {
+            "repo_url": "https://github.com/your-org/how-to-pulumi-decoupled-ai.git",
+            "branch": "refs/heads/main",
+        },
+    },
+    operation_context={
+        "pre_run_commands": [],
+        "environment_variables": {},
+    },
+)
+
+ttl_schedule = pulumiservice.TtlSchedule(
+    "training-node-ttl",
+    organization=pulumi.get_organization(),
+    project=pulumi.get_project(),
+    stack=pulumi.get_stack(),
+    timestamp=destroy_at,
+    # Do not also delete the stack record itself - just the resources. The
+    # stack (and its Drift/TTL history) should persist for the next run.
+    delete_after_destroy=False,
+    opts=pulumi.ResourceOptions(depends_on=[training_pod, deployment_settings]),
+)
+
 pulumi.export("active_compute_pod", training_pod.metadata.apply(lambda m: m.get("name") if m else None))
+pulumi.export("ttl_destroy_at", destroy_at)
