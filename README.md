@@ -16,8 +16,8 @@ By uncoupling your data lakehouse from your compute engine, you maintain enterpr
 
 * **Zero Static Keys:** Dynamic OIDC token federation using **Pulumi ESC**.
 * **Isolated Cloud Lifecycles:** Decoupled stacks using **Pulumi Stack References** to separate long-lived storage from ephemeral hardware.
-* **Runaway Cost Prevention:** Programmatic failure traps and automated lifecycle teardowns to prevent $0/hour compute states from idling when jobs fail or complete.
-* **A Real Cross-Cloud Network Path:** A Megaport private circuit between AWS and CoreWeave, provisioned as part of the permanent data plane — not assumed to exist.
+* **Runaway Cost Prevention:** Programmatic failure traps for explicit crashes, plus a separate TTL kill-clock (Section 6a) that bounds the cost of a workload that hangs silently with no error at all.
+* **A Real, Encrypted Cross-Cloud Network Path:** A Megaport private circuit between AWS and CoreWeave, with MACsec encryption enforced on the AWS-facing hop — provisioned as part of the permanent data plane, not assumed to exist.
 
 ---
 
@@ -128,6 +128,25 @@ aws.s3.BucketLifecycleConfigurationV2(
 
 Full implementation: [`infra_data_platform/__main__.py`](./infra_data_platform/__main__.py).
 
+### Encrypting the AWS-Facing Hop of the Bridge
+
+**Why:** A private circuit isn't the same claim as an encrypted one. Megaport's `Vxc` resource has no encryption property of its own — MACsec is a physical-link-layer feature configured on the AWS Direct Connect connection itself, not something Megaport's SDN exposes.
+
+**How:** `aws.directconnect.Connection` is provisioned with `request_macsec=True` and `encryption_mode="must_encrypt"`, so AWS terminates and enforces encryption on its end; Megaport's circuit carries the already-encrypted frames transparently:
+
+```python
+# infra_data_platform/__main__.py (excerpt)
+aws_dx_connection = aws.directconnect.Connection(
+    "aws-coreweave-dx-connection",
+    bandwidth="10Gbps",  # MACsec requires a dedicated 10Gbps+ connection
+    location="EqDA2",
+    request_macsec=True,
+    encryption_mode="must_encrypt",
+)
+```
+
+This is a real physical link, not something a single `pulumi up` fully activates: MACsec is only available at select Direct Connect locations, and `encryption_mode` only takes effect once the connection reaches an "Available" state after its physical cross-connect is installed at a colocation facility.
+
 ---
 
 ## 5. Ephemeral Compute Plane
@@ -198,6 +217,32 @@ Several assumptions/principles underpin what happens on failure:
 
 ---
 
+## 6a. TTL Kill-Clock: Bounding the Cost of a Silent Hang
+
+**Why:** The failure trap in Section 6 only fires when the training script itself exits non-zero — a genuine crash. It does nothing for the harder, more expensive case: a process that never exits at all, stuck with no error to report. Nothing upstream — not the failure trap, not `train.yml`'s `kubectl logs -f` step — can distinguish that from a slow-but-healthy run, so nothing reclaims it, and the cluster keeps billing.
+
+**How:** `pulumiservice.TtlSchedule` — a real Pulumi Cloud resource, not custom code — schedules an automatic destroy N hours after deploy, regardless of the pod's state at that point:
+
+```python
+# infra_ml_compute/__main__.py (excerpt)
+ttl_schedule = pulumiservice.TtlSchedule(
+    "training-node-ttl",
+    organization=pulumi.get_organization(),
+    project=pulumi.get_project(),
+    stack=pulumi.get_stack(),
+    timestamp=destroy_at,  # now + ttlHours, computed at deploy time
+    delete_after_destroy=False,
+)
+```
+
+`TtlSchedule` executes on Pulumi's own hosted runners (Pulumi Deployments) rather than this repo's GitHub Actions, so the kill-clock still fires even if the GitHub Actions run that created it has long since finished — which is also why `pulumiservice.DeploymentSettings` has to be configured first; see the comments in `infra_ml_compute/__main__.py` for the full prerequisite chain.
+
+**What this deliberately doesn't do:** extend the clock for a run that's still legitimately healthy past that window. Doing that safely needs a health signal from inside the training process — a heartbeat file, a liveness check tied to real training progress — that this blueprint doesn't implement, the same category of assumption as the `.done` checkpoint marker in Section 6: it depends on data-science-side instrumentation this repo doesn't own. If you add that signal, the extension pattern is a second scheduled step that reads it and, when healthy, calls the Pulumi Cloud Schedules API's TTL update endpoint to push `destroy_at` forward using this resource's `schedule_id` output.
+
+Full implementation: [`infra_ml_compute/__main__.py`](./infra_ml_compute/__main__.py).
+
+---
+
 ## 7. Shift-Left Unit Verification
 
 **Why:** A syntax error, a malformed resource key, or a missing variable shouldn't trigger an expensive hardware allocation to discover.
@@ -216,6 +261,12 @@ def test_gpu_resource_limits_are_correct(self):
 
 This test exists because an earlier draft of this stack used a malformed key (`"://nvidia.com"`) that would have failed at deploy time — and had a test that asserted the broken value instead of catching it. Full test suite: [`infra_ml_compute/tests/test_ml_compute.py`](./infra_ml_compute/tests/test_ml_compute.py), [`infra_data_platform/tests/test_data_platform.py`](./infra_data_platform/tests/test_data_platform.py).
 
+### Shift-Left Policy Enforcement (Example)
+
+**Why:** Unit tests validate a stack against *its own* expectations — they only catch what someone thought to assert. Policy-as-code validates a stack against organization-wide rules, evaluated automatically during `preview`/`up`, regardless of whether the person writing that particular stack knew the rule existed.
+
+**How:** [`policy-pack-example/`](./policy-pack-example/) is a minimal `PolicyPack` wired into `train.yml` via `pulumi up --policy-pack ../policy-pack-example`. **This pack is illustrative, not prescriptive** — its two policies (S3 public-access blocking, GPU pod resource limits) deliberately check things this repo's stacks already do correctly, to demonstrate the mechanism working end-to-end. It is not a statement of what policies a real deployment of this architecture needs; a production policy pack would come from a pre-built compliance framework or your platform team, not a how-to repo. See the docstrings in [`policy-pack-example/__main__.py`](./policy-pack-example/__main__.py) for the reasoning behind each example policy.
+
 ---
 
 ## 8. GitOps Lifecycle Orchestration
@@ -232,7 +283,8 @@ THE PROGRAMMATIC GITOPS LIFECYCLE
                            ▼
 [ PHASE 1 ] ────────► Shift-Left Validation (pytest + set_mocks)      [ Pass: $0 Spent ]
                            ▼
-[ PHASE 2 ] ────────► Provision Ephemeral Stack (CoreWeave H100 Pod JIT Spin-up)
+[ PHASE 2 ] ────────► Provision Ephemeral Stack (policy-checked `pulumi up`,
+                       CoreWeave H100 Pod JIT Spin-up + TTL kill-clock attached)
                            ▼
 [ PHASE 3 ] ────────► Stream Logs, Capture Real Exit Code
                            ├───► Exit 0 (Success) ──────► 'pulumi destroy' (Stop Billing)
@@ -277,14 +329,18 @@ PyTorch dataloaders (via `mosaicml-streaming`) can't stream directly into GPU VR
 .
 ├── ci_staged_gh/                  # Rename to .github/ to activate - staged here to avoid kicking off a live GH Action.
 │   └── workflows/
-│       ├── train.yml              # Main GitOps pipeline: test-gate → deploy → monitor → auto-rescue on failure → destroy/alert
+│       ├── train.yml              # Main GitOps pipeline: test-gate → policy-checked deploy → monitor → auto-rescue on failure → destroy/alert
 │       └── cleanup.yml            # Manual, human-triggered force-teardown of a node held by the failure trap
 ├── ESC-env-def.yaml               # Pulumi ESC central environment definition
+├── policy-pack-example/           # ILLUSTRATIVE example policy pack (not prescriptive - see Section 7)
+│   ├── PulumiPolicy.yaml
+│   ├── __main__.py
+│   └── requirements.txt
 ├── infra_data_platform/           # PERMANENT DATA PLANE STACK
 │   ├── Pulumi.yaml
 │   ├── Pulumi.production.yaml
 │   ├── __init__.py
-│   ├── __main__.py                # AWS VPC, S3 buckets, Databricks workspace, Megaport bridge
+│   ├── __main__.py                # AWS VPC, S3 buckets, Databricks workspace, Megaport bridge + MACsec
 │   ├── requirements.txt
 │   └── tests/
 │       ├── __init__.py
@@ -293,7 +349,7 @@ PyTorch dataloaders (via `mosaicml-streaming`) can't stream directly into GPU VR
     ├── Pulumi.yaml
     ├── Pulumi.production.yaml
     ├── __init__.py
-    ├── __main__.py                 # CoreWeave K8s provider, NVMe cache bucket, pod with failure trap
+    ├── __main__.py                 # CoreWeave K8s provider, NVMe cache bucket, pod with failure trap, TTL kill-clock
     ├── requirements.txt
     └── tests/
         ├── __init__.py
