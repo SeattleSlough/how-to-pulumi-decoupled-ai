@@ -83,12 +83,33 @@ jobs:
     # whatever policy-pack input syntax a given action version supports.
     # This is the example pack from policy-pack-example/ - see that
     # directory's __main__.py for why it's illustrative, not prescriptive.
+    #
+    # This same `pulumi up` also creates the TTL kill-clock declared in
+    # infra_ml_compute/__main__.py (pulumiservice.TtlSchedule) - it's not a
+    # separate step because it's just another resource in that stack, not
+    # something train.yml calls directly. The next step surfaces the
+    # resulting destroy time so it's actually visible from this pipeline
+    # rather than only discoverable by reading __main__.py.
     - name: Provision Ephemeral CoreWeave Compute (policy-checked)
       id: pulumi_up
       working-directory: infra_ml_compute
       run: |
         pulumi stack select production
         pulumi up --yes --policy-pack ../policy-pack-example
+      env:
+        PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+
+    # Surfaces the TTL kill-clock's destroy time set by the step above, so
+    # anyone watching this run can see when the hard reclaim will fire
+    # without having to go find the TtlSchedule resource in __main__.py.
+    - name: Report TTL Kill-Clock
+      id: ttl_report
+      working-directory: infra_ml_compute
+      run: |
+        TTL_DESTROY_AT=$(pulumi stack output ttl_destroy_at)
+        echo "destroy_at=$TTL_DESTROY_AT" >> "$GITHUB_OUTPUT"
+        echo "### TTL Kill-Clock" >> "$GITHUB_STEP_SUMMARY"
+        echo "This stack will be automatically destroyed at **${TTL_DESTROY_AT}** if not torn down sooner (crash, or a successful run's normal teardown)." >> "$GITHUB_STEP_SUMMARY"
       env:
         PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
 
@@ -118,7 +139,7 @@ jobs:
       if: failure() && steps.monitor.outcome == 'failure'
       run: |
         curl -X POST -H 'Content-type: application/json' \
-          --data '{"text":"🚨 *ML Cluster Crash Alert*: `training-model` failed. Compute node and NVMe local storage are frozen for engineering inspection. Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' \
+          --data '{"text":"🚨 *ML Cluster Crash Alert*: `training-model` failed. Compute node and NVMe local storage are frozen for engineering inspection. Node will still be auto-reclaimed by its TTL kill-clock at '"${TTL_DESTROY_AT}"' if nobody runs cleanup.yml first. Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' \
           "${{ secrets.SLACK_WEBHOOK_URL }}"
 
         curl -X POST "${{ secrets.PAGERDUTY_EVENTS_URL }}" \
@@ -132,6 +153,8 @@ jobs:
               "severity": "critical"
             }
           }'
+      env:
+        TTL_DESTROY_AT: ${{ steps.ttl_report.outputs.destroy_at }}
 
     # Runs automatically on failure.
     # Files under a /logs/ subdirectory are copied to rescue-logs/.
@@ -205,3 +228,4 @@ jobs:
         work-dir: infra_ml_compute
       env:
         PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+

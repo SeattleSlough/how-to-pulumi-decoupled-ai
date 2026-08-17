@@ -241,6 +241,8 @@ ttl_schedule = pulumiservice.TtlSchedule(
 
 Full implementation: [`infra_ml_compute/__main__.py`](./infra_ml_compute/__main__.py).
 
+**Interaction with the failure trap (Section 6) worth knowing:** the TTL kill-clock has no awareness of *why* a node is still running — it fires at its scheduled time whether the pod is healthy, hung, or deliberately held open by the failure trap for crash forensics. If an engineer doesn't run `cleanup.yml` before the TTL expires, Pulumi Cloud destroys the node anyway, taking the held-open NVMe state and live node access with it. The TTL bounds cost; it does not defer to an in-progress human investigation. If that's not the behavior you want, either set `ttlHours` generously enough to cover a realistic inspection window, or extend `cleanup.yml`/the TTL schedule to cancel or push back the clock as soon as a human starts investigating a crash - this repo doesn't implement that coordination.
+
 ---
 
 ## 7. Shift-Left Unit Verification
@@ -378,4 +380,5 @@ To run a test deployment:
    ```
 
 3. Rename `ci_staged_gh/` to `.github/` then trigger `train.yml` via the Actions tab, a push commit, the scheduled timer, or an upstream webhook dispatch.
+
 
